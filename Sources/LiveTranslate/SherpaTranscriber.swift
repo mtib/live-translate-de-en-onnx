@@ -417,8 +417,13 @@ final class SherpaTranscriber: Transcriber {
 
     // MARK: — Worker
 
+    /// Maximum words per emitted row. When a group's text exceeds this,
+    /// `emitGroup` splits at the next ". " boundary past the cap.
+    private static let maxWordsPerRow = 20
+
     /// Splits the turn at VAD silence gaps ≥ `vadSplitGapSamples`, then
-    /// emits one `.completed` per group. No speaker labels in the text.
+    /// emits one row per group (further split at sentence boundaries if
+    /// a group exceeds `maxWordsPerRow`).
     private func processTurn(
         turn: TurnRecord,
         source: SourceTag,
@@ -430,8 +435,7 @@ final class SherpaTranscriber: Transcriber {
             return
         }
 
-        // Group voiced segments: merge adjacent ones whose gap is < threshold,
-        // start a new group when the silence gap reaches the split threshold.
+        // Group voiced segments: merge when gap < threshold, split when ≥.
         struct SegGroup {
             let startSample: Int
             var endSample: Int
@@ -462,15 +466,13 @@ final class SherpaTranscriber: Transcriber {
                                sampleCount: 1)]
         }
 
-        // Fast path: single group — no split.
+        // Fast path: single group.
         if groups.count == 1 {
-            let g = groups[0]
             Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index) → \"\(turn.text.prefix(60))\"")
-            emit(chunkID: turn.chunkID, source: source, text: turn.text,
-                 startSeconds: Double(turn.startSample) / 16_000,
-                 endSeconds:   Double(turn.endSample)   / 16_000,
-                 continuation: continuation)
-            _ = g  // suppress unused warning
+            emitGroup(firstChunkID: turn.chunkID, source: source, text: turn.text,
+                      startSeconds: Double(turn.startSample) / 16_000,
+                      endSeconds:   Double(turn.endSample)   / 16_000,
+                      continuation: continuation)
             return
         }
 
@@ -506,10 +508,40 @@ final class SherpaTranscriber: Transcriber {
 
             let chunkID = gi == 0 ? turn.chunkID : UUID()
             Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index).\(gi+1) split → \"\(groupText.prefix(60))\"")
-            emit(chunkID: chunkID, source: source, text: groupText,
-                 startSeconds: Double(group.startSample) / 16_000,
-                 endSeconds:   Double(group.endSample)   / 16_000,
+            emitGroup(firstChunkID: chunkID, source: source, text: groupText,
+                      startSeconds: Double(group.startSample) / 16_000,
+                      endSeconds:   Double(group.endSample)   / 16_000,
+                      continuation: continuation)
+        }
+    }
+
+    /// Emit one group of text, further splitting at ". " boundaries if the
+    /// group exceeds `maxWordsPerRow`. Timing is distributed proportionally
+    /// by word count across the sub-sentences.
+    /// `firstChunkID` is reused for the first sub-sentence; subsequent ones
+    /// get fresh UUIDs (Pipeline handles unknown IDs gracefully).
+    private func emitGroup(
+        firstChunkID: UUID, source: SourceTag, text: String,
+        startSeconds: Double, endSeconds: Double,
+        continuation: AsyncThrowingStream<SessionSnapshot, Error>.Continuation
+    ) {
+        let parts = splitAtSentenceBoundaries(text, maxWords: Self.maxWordsPerRow)
+        let wordCounts = parts.map { $0.split(separator: " ", omittingEmptySubsequences: true).count }
+        let totalWords = wordCounts.reduce(0, +)
+        let duration = endSeconds - startSeconds
+
+        var t = startSeconds
+        var cumWords = 0
+        for (i, part) in parts.enumerated() {
+            cumWords += wordCounts[i]
+            let end = i == parts.count - 1
+                ? endSeconds
+                : startSeconds + duration * Double(cumWords) / Double(max(totalWords, 1))
+            emit(chunkID: i == 0 ? firstChunkID : UUID(),
+                 source: source, text: part,
+                 startSeconds: t, endSeconds: end,
                  continuation: continuation)
+            t = end
         }
     }
 
@@ -525,6 +557,25 @@ final class SherpaTranscriber: Transcriber {
             SessionSentence(text: text, isFinal: true,
                             startSeconds: startSeconds, endSeconds: endSeconds)
         ]))
+    }
+
+    /// Split `text` into parts of ≤ `maxWords` words, breaking only at word
+    /// boundaries where the preceding word ends with ".". If no such boundary
+    /// exists past the cap, the whole text is returned as one part.
+    private func splitAtSentenceBoundaries(_ text: String, maxWords: Int) -> [String] {
+        let words = text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard words.count > maxWords else { return [text] }
+        var result: [String] = []
+        var current: [String] = []
+        for word in words {
+            current.append(word)
+            if current.count >= maxWords && word.hasSuffix(".") {
+                result.append(current.joined(separator: " "))
+                current = []
+            }
+        }
+        if !current.isEmpty { result.append(current.joined(separator: " ")) }
+        return result
     }
 
     // MARK: — Helpers
