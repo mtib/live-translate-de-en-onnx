@@ -288,12 +288,16 @@ private struct SentenceRow: View {
     }
 }
 
-/// In-flight chunk row — reserves UI space the moment a chunk's voice
-/// is detected. Icon on the left is the source (mic or speaker, same
-/// as `SentenceRow` so the layout stays stable through graduation).
-/// The body is an italic state word ("listening", "transcribing",
-/// "translating") and — once whisper has returned text — the
-/// transcription itself, ready for the translation to land.
+/// In-flight chunk row. Lifecycle:
+///   `.listening`  → shows "listening"
+///   `.partial`    → shows the live ASR partial (or its translation once the
+///                   1 s throttle has fired); same italic/secondary style so
+///                   it's visually distinct from graduated sentences
+///   `.translating`→ shows "translating" + source text in caption
+///
+/// The layout always matches `SentenceRow` (same icon width, same VStack
+/// structure) so SwiftUI's row-swap animation is smooth when a chunk
+/// graduates and the inflight row is replaced by the final sentence.
 private struct InflightRow: View {
     let chunk: InflightChunk
     let compact: Bool
@@ -305,29 +309,44 @@ private struct InflightRow: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 14, alignment: .center)
             VStack(alignment: .leading, spacing: 1) {
-                Text(stateLabel)
+                Text(primaryText)
                     .font(compact ? .callout : .body)
                     .italic()
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                // Once whisper has returned text, show it in the
-                // caption slot while the italic primary line shifts
-                // to "translating" — same layout as a graduated row.
-                if !compact, case .translating(let text) = chunk.state {
-                    Text(text)
+                    .textSelection(.enabled)
+                if !compact, let cap = captionText {
+                    Text(cap)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
                 }
             }
         }
     }
 
-    private var stateLabel: String {
+    /// The main line. For `.partial` we show the translation when available
+    /// (mirrors what a graduated `SentenceRow` shows), falling back to the
+    /// raw ASR text. For other states we show a state word.
+    private var primaryText: String {
         switch chunk.state {
-        case .listening: return "listening"
-        case .transcribing: return "transcribing"
+        case .listening:   return "listening"
+        case .partial(let text, let translation): return translation ?? text
         case .translating: return "translating"
+        }
+    }
+
+    /// Caption line (full mode only): source text when we're showing its
+    /// translation, so the layout mirrors a graduated SentenceRow.
+    private var captionText: String? {
+        switch chunk.state {
+        case .partial(let text, let translation):
+            return translation != nil ? text : nil
+        case .translating(let text):
+            return text
+        default:
+            return nil
         }
     }
 }

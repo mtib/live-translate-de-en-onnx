@@ -90,6 +90,11 @@ final class Pipeline: ObservableObject {
     private var translationCache: [String: String] = [:]
     private let maxCacheEntries: Int = 200
 
+    /// Last time we dispatched a partial translation per chunk. Used to
+    /// throttle partial translations to at most once per second so we
+    /// don't flood the translator with every token emission.
+    private var partialTranslationTimers: [UUID: Date] = [:]
+
     private var runTask: Task<Void, Never>?
     /// Shared JSONL archive — sentences from all sources interleave
     /// here, distinguished by the `source` field.
@@ -169,15 +174,41 @@ final class Pipeline: ObservableObject {
     ) {
         switch event {
         case .listening:
-            // Reserve a row at voice onset. UI shows "listening".
+            // Reserve a row at voice onset.
             inflightChunks.append(InflightChunk(
                 id: id, source: source, startedAt: Date(), state: .listening
             ))
 
-        case .transcribing:
-            // Chunk closed, whisper running. UI flips to "transcribing".
-            if let idx = inflightChunks.firstIndex(where: { $0.id == id }) {
-                inflightChunks[idx].state = .transcribing
+        case .partial(let text):
+            // Streaming ASR produced new tokens. Show the partial text in the
+            // UI row and, at most once per second, kick off a translation so
+            // the user sees a rolling translated preview.
+            guard let idx = inflightChunks.firstIndex(where: { $0.id == id }) else { return }
+            // Preserve any translation we already have for this chunk.
+            let existingTranslation: String?
+            if case .partial(_, let t) = inflightChunks[idx].state { existingTranslation = t }
+            else { existingTranslation = nil }
+            inflightChunks[idx].state = .partial(text: text, translation: existingTranslation)
+
+            let srcLang = String(self.source.identifier.prefix(2))
+            let tgtLang = self.target.code
+            if srcLang == tgtLang {
+                // Same language — translation IS the transcription.
+                inflightChunks[idx].state = .partial(text: text, translation: text)
+                return
+            }
+            // Throttle: at most one dispatch per second per chunk.
+            let now = Date()
+            guard now.timeIntervalSince(partialTranslationTimers[id] ?? .distantPast) >= 1.0 else { return }
+            partialTranslationTimers[id] = now
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard let translated = try? await self.translator.translate(text) else { return }
+                // Only apply if the chunk is still showing this exact partial text.
+                guard let idx = self.inflightChunks.firstIndex(where: { $0.id == id }),
+                      case .partial(let cur, _) = self.inflightChunks[idx].state,
+                      cur == text else { return }
+                self.inflightChunks[idx].state = .partial(text: text, translation: translated)
             }
 
         case .completed(let text, let startSeconds, let endSeconds):
@@ -231,9 +262,9 @@ final class Pipeline: ObservableObject {
 
         case .dropped:
             // Chunk filtered out by the worker (no voice, too short,
-            // empty whisper output). No sentence to graduate; just
-            // drop the inflight row.
+            // empty text). No sentence to graduate; just drop the row.
             inflightChunks.removeAll { $0.id == id }
+            partialTranslationTimers.removeValue(forKey: id)
         }
     }
 
@@ -253,6 +284,7 @@ final class Pipeline: ObservableObject {
         )
         sentences.append(sentence)
         inflightChunks.removeAll { $0.id == id }
+        partialTranslationTimers.removeValue(forKey: id)
         recordSentence(sentence)
         // Feed the translation into the live audio stream. The
         // speaker is nil when no voice is installed for the target
@@ -375,6 +407,7 @@ final class Pipeline: ObservableObject {
             mergedSubtitles.removeAll()
             currentOutputs = nil
             inflightChunks.removeAll()
+            partialTranslationTimers.removeAll()
             ttsSpeaker?.stop()
             ttsSpeaker = nil
             liveAudioServer?.stop()

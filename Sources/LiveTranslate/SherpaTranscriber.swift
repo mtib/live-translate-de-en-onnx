@@ -10,17 +10,19 @@ import CSherpaOnnx
 ///   2. Resample to 16 kHz (AVAudioConverter, persistent across buffers).
 ///   3. Push samples into a Silero-VAD instance for voiced/silence detection.
 ///   4. Push voiced samples into the sherpa-onnx streaming recognizer.
-///   5. On each endpoint (≥1 s trailing silence), read the committed partial
-///      text BEFORE resetting the stream, then send (text + voiced segments)
-///      to the worker task.
-///   6. Worker assigns speaker labels via campplus embedding per voiced
-///      segment; if the speaker changes mid-turn the text is split
-///      proportionally and emitted as separate completed chunks —
-///      **no speaker label is included in the text itself**.
+///   5. As ASR emits tokens, fire `.partial(text:)` lifecycle events so the
+///      UI updates with live text instead of showing "transcribing".
+///   6. On each endpoint (≥1 s trailing silence), read the committed text
+///      BEFORE resetting the stream, then split it into groups wherever the
+///      VAD showed a silence gap ≥ 0.5 s — each group becomes a separate row.
 ///
-/// **Crosstalk suppression:** same `markSystemVoiced` / `isSystemRecentlyVoiced`
-/// pattern as WhisperCppTranscriber — mic buffers are zeroed when system audio
-/// was recently heard.
+/// **Speaker diarization removed.** Rows are split by VAD silence gaps alone,
+/// not by campplus embedding. This avoids the campplus latency and the
+/// proportional-text-split approximation while still cleanly separating most
+/// speaker turns in natural conversation.
+///
+/// **Crosstalk suppression:** `markSystemVoiced` / `isSystemRecentlyVoiced`
+/// — mic buffers are zeroed when system audio was recently heard.
 final class SherpaTranscriber: Transcriber {
 
     // MARK: — Tunables
@@ -28,17 +30,16 @@ final class SherpaTranscriber: Transcriber {
     /// Trailing-silence endpoint threshold fed to sherpa-onnx rule 1.
     static let endpointSilenceSeconds: Float = 1.0
 
-    /// RMS used for the crosstalk gate (mirrors WhisperCppTranscriber).
+    /// RMS used for the crosstalk gate.
     static let silenceRMSThreshold: Float = 0.012
 
     /// How long after system-voiced we keep treating mic as contaminated.
     static let crosstalkPersistSeconds: TimeInterval = 0.25
 
-    /// Minimum voiced-segment duration (in 16 kHz samples) to attempt
-    /// speaker embedding. Segments shorter than this are merged into the
-    /// preceding group rather than getting their own embedding, avoiding
-    /// unreliable classifications for sub-100ms noise bursts.
-    private static let minEmbeddingSamples = 1_600   // 0.1 s at 16 kHz
+    /// Silence gap between two voiced segments that triggers a row split.
+    /// 0.5 s is long enough to catch most speaker-turn boundaries while
+    /// leaving typical within-sentence clause pauses intact.
+    private static let vadSplitGapSamples: Int = Int(0.5 * 16_000)
 
     // MARK: — Shared recognizer (loaded once, reused)
 
@@ -46,16 +47,17 @@ final class SherpaTranscriber: Transcriber {
     private let recognizerLock = NSLock()
     private var loadError: Error?
 
-    private let speakerTracker: SpeakerTracker?
-
-    // MARK: — Lifecycle callback (same contract as WhisperCppTranscriber)
+    // MARK: — Lifecycle callback
 
     var onChunkLifecycle: (@Sendable (_ chunkID: UUID, _ source: SourceTag,
                                        _ event: ChunkLifecycle) -> Void)?
 
     enum ChunkLifecycle: Sendable {
         case listening
-        case transcribing
+        /// Live partial ASR hypothesis — fires whenever the token stream
+        /// changes during an open turn, so the UI can show rolling text
+        /// instead of "transcribing".
+        case partial(text: String)
         case completed(text: String, startSeconds: Double?, endSeconds: Double?)
         case dropped
     }
@@ -66,8 +68,7 @@ final class SherpaTranscriber: Transcriber {
     private let crosstalkLock = NSLock()
 
     func markSystemVoiced() {
-        let now = Date()
-        crosstalkLock.withLock { lastSystemVoicedAt = now }
+        crosstalkLock.withLock { lastSystemVoicedAt = Date() }
     }
 
     func isSystemRecentlyVoiced() -> Bool {
@@ -75,16 +76,6 @@ final class SherpaTranscriber: Transcriber {
         return crosstalkLock.withLock {
             now.timeIntervalSince(lastSystemVoicedAt) < Self.crosstalkPersistSeconds
         }
-    }
-
-    // MARK: — Init
-
-    init() {
-        speakerTracker = SpeakerTracker()
-    }
-
-    deinit {
-        if let r = recognizer { SherpaOnnxDestroyOnlineRecognizer(r) }
     }
 
     // MARK: — Model loading
@@ -95,7 +86,6 @@ final class SherpaTranscriber: Transcriber {
         if let r = recognizer { return r }
         if let e = loadError   { throw e }
 
-        // Resolve absolute paths from the app bundle.
         let enc = resourcePath(ModelConfig.asrEncoder)
         let dec = resourcePath(ModelConfig.asrDecoder)
         let joi = resourcePath(ModelConfig.asrJoiner)
@@ -113,8 +103,6 @@ final class SherpaTranscriber: Transcriber {
         cfg.model_config.num_threads = Int32(max(2, ProcessInfo.processInfo.activeProcessorCount - 2))
         cfg.model_config.debug = 0
 
-        // C-string lifetimes must span the SherpaOnnx call. Use nested
-        // withCString blocks so each pointer remains valid throughout.
         let method   = "greedy_search"
         let provider = ModelConfig.provider
 
@@ -148,6 +136,10 @@ final class SherpaTranscriber: Transcriber {
         return r
     }
 
+    deinit {
+        if let r = recognizer { SherpaOnnxDestroyOnlineRecognizer(r) }
+    }
+
     // MARK: — Transcriber protocol
 
     func transcribe(
@@ -177,26 +169,23 @@ final class SherpaTranscriber: Transcriber {
 
     // MARK: — Internal data models
 
-    /// A contiguous voiced interval within a turn, bounded by VAD silence.
-    /// Used for per-segment speaker embedding so that speaker changes within
-    /// a single endpoint-bounded turn can be detected and split.
+    /// A contiguous voiced interval bounded by VAD-detected silence.
+    /// The accumulator records one per voiced run within a turn so that
+    /// `processTurn` can split the endpoint text at silence gaps ≥ the
+    /// `vadSplitGapSamples` threshold.
     private struct VoicedSegment: Sendable {
-        let samples: [Float]    // 16 kHz
-        let startSample: Int    // cumulative 16 kHz offset
-        let endSample: Int
+        let startSample: Int   // cumulative 16 kHz offset at segment onset
+        let endSample: Int     // cumulative 16 kHz offset at segment end
+        let sampleCount: Int   // voiced samples in this segment (for proportion)
     }
 
-    /// Everything the worker needs to label and fire lifecycle events.
     private struct TurnRecord: Sendable {
         let chunkID: UUID
         let index: Int
         let text: String
-        /// Individual voiced intervals (silence-gap-separated runs of speech).
-        /// Empty only when the turn had audio but VAD never detected speech
-        /// (unusual — the endpoint detector requires prior voice activity).
         let voicedSegments: [VoicedSegment]
-        let startSample: Int    // cumulative 16 kHz offset at turn open
-        let endSample: Int      // cumulative 16 kHz offset at endpoint
+        let startSample: Int
+        let endSample: Int
     }
 
     // MARK: — Chunk loop
@@ -208,9 +197,6 @@ final class SherpaTranscriber: Transcriber {
         continuation: AsyncThrowingStream<SessionSnapshot, Error>.Continuation
     ) async throws {
         let (queue, queueSink) = AsyncStream<TurnRecord>.makeStream()
-        // OpaquePointer doesn't conform to Sendable. Round-trip through UInt
-        // (same pattern as the previous WhisperCppTranscriber) so the closure
-        // capture is a value type and Swift's Sendable checker is satisfied.
         let recognizerBits = UInt(bitPattern: recognizer)
 
         async let accumulate: Void = {
@@ -253,18 +239,21 @@ final class SherpaTranscriber: Transcriber {
         }
         defer { SherpaOnnxDestroyOnlineStream(stream) }
 
-        // Turn-level state.
+        // Turn-level bookkeeping.
         var turnStartSample = 0
         var cumulativeSamples = 0
         var chunkIndex = 0
         var currentChunkID: UUID? = nil
         var hadVoice = false
 
-        // Voiced-segment tracking within the current turn.
+        // Voiced-segment tracking (for VAD-gap splitting at endpoint).
         var voicedSegments: [VoicedSegment] = []
-        var currentSegSamples: [Float] = []
         var currentSegStart = 0
+        var currentSegSampleCount = 0
         var prevVoiced = false
+
+        // Partial-text dedup.
+        var lastPartialText = ""
 
         Log.line("SherpaTranscriber[\(tag)]: accumulator started")
 
@@ -273,22 +262,19 @@ final class SherpaTranscriber: Transcriber {
             guard let samples16k = resampler.convert(buf), !samples16k.isEmpty else { continue }
             let n = samples16k.count
 
-            // Crosstalk gate for mic stream.
+            // Crosstalk gate for mic.
             var effective = samples16k
             if source == .mic && isSystemRecentlyVoiced() {
                 effective = [Float](repeating: 0, count: n)
             }
 
-            // Stamp system-voiced for crosstalk detection.
             if source == .system {
-                let rms = computeRMS(effective)
-                if rms >= Self.silenceRMSThreshold { markSystemVoiced() }
+                if computeRMS(effective) >= Self.silenceRMSThreshold { markSystemVoiced() }
             }
 
             let samplesBefore = cumulativeSamples
             cumulativeSamples += n
 
-            // Feed samples into both VAD and ASR.
             effective.withUnsafeBufferPointer { ptr in
                 if let v = vad {
                     SherpaOnnxVoiceActivityDetectorAcceptWaveform(v, ptr.baseAddress, Int32(n))
@@ -296,7 +282,6 @@ final class SherpaTranscriber: Transcriber {
                 SherpaOnnxOnlineStreamAcceptWaveform(stream, 16_000, ptr.baseAddress, Int32(n))
             }
 
-            // Detect speech via VAD (or RMS fallback).
             let voiced: Bool
             if let v = vad {
                 voiced = SherpaOnnxVoiceActivityDetectorDetected(v) != 0
@@ -307,56 +292,62 @@ final class SherpaTranscriber: Transcriber {
 
             if voiced {
                 if !hadVoice {
-                    // Voice onset for this turn.
                     let id = UUID()
                     currentChunkID = id
                     turnStartSample = samplesBefore
-                    Log.line("SherpaTranscriber[\(tag)]: voice onset #\(chunkIndex + 1) (id=\(id.uuidString.prefix(8))) at \(String(format:"%.2f",Double(samplesBefore)/16_000))s")
+                    chunkIndex += 1
+                    Log.line("SherpaTranscriber[\(tag)]: voice onset #\(chunkIndex) (id=\(id.uuidString.prefix(8))) at \(String(format:"%.2f",Double(samplesBefore)/16_000))s")
                     onChunkLifecycle?(id, source, .listening)
                     hadVoice = true
                 }
                 if !prevVoiced {
-                    // Voiced-segment onset within the turn.
+                    // Voiced-segment onset.
                     currentSegStart = samplesBefore
-                    currentSegSamples.removeAll(keepingCapacity: true)
+                    currentSegSampleCount = 0
                 }
-                currentSegSamples.append(contentsOf: effective)
-            } else if prevVoiced && !currentSegSamples.isEmpty {
-                // Voiced → silent transition: close the current segment.
+                currentSegSampleCount += n
+            } else if prevVoiced && currentSegSampleCount > 0 {
+                // Voiced → silent: close the current segment.
                 voicedSegments.append(VoicedSegment(
-                    samples: currentSegSamples,
                     startSample: currentSegStart,
-                    endSample: samplesBefore
+                    endSample: samplesBefore,
+                    sampleCount: currentSegSampleCount
                 ))
-                currentSegSamples.removeAll(keepingCapacity: true)
+                currentSegSampleCount = 0
             }
 
             prevVoiced = voiced
 
-            // Decode whenever ready.
             while SherpaOnnxIsOnlineStreamReady(recognizer, stream) != 0 {
                 SherpaOnnxDecodeOnlineStream(recognizer, stream)
             }
 
+            // Emit partial text whenever the hypothesis changes.
+            if hadVoice, let id = currentChunkID,
+               let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) {
+                let partial = String(cString: result.pointee.text)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                SherpaOnnxDestroyOnlineRecognizerResult(result)
+                if !partial.isEmpty && partial != lastPartialText {
+                    lastPartialText = partial
+                    onChunkLifecycle?(id, source, .partial(text: partial))
+                }
+            }
+
             // Endpoint check.
             if hadVoice && SherpaOnnxOnlineStreamIsEndpoint(recognizer, stream) != 0 {
-                chunkIndex += 1
-                if let id = currentChunkID {
-                    onChunkLifecycle?(id, source, .transcribing)
-                }
-
-                // Close any open voiced segment (silence triggered endpoint
-                // so prevVoiced is likely false, but guard anyway).
-                if !currentSegSamples.isEmpty {
+                // Close any open segment (silence caused the endpoint,
+                // so prevVoiced is likely false; guard for the edge case).
+                if currentSegSampleCount > 0 {
                     voicedSegments.append(VoicedSegment(
-                        samples: currentSegSamples,
                         startSample: currentSegStart,
-                        endSample: cumulativeSamples
+                        endSample: cumulativeSamples,
+                        sampleCount: currentSegSampleCount
                     ))
-                    currentSegSamples.removeAll(keepingCapacity: true)
+                    currentSegSampleCount = 0
                 }
 
-                // *** Read the committed text BEFORE resetting the stream. ***
+                // *** Read text BEFORE reset ***
                 let text: String
                 if let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) {
                     text = String(cString: result.pointee.text)
@@ -377,34 +368,31 @@ final class SherpaTranscriber: Transcriber {
                     endSample: cumulativeSamples
                 ))
 
-                // Reset for the next turn.
                 SherpaOnnxOnlineStreamReset(recognizer, stream)
                 voicedSegments.removeAll(keepingCapacity: true)
                 turnStartSample = cumulativeSamples
                 currentChunkID = nil
                 hadVoice = false
                 prevVoiced = false
+                lastPartialText = ""
             }
         }
 
-        // Flush any in-flight turn when the audio stream ends.
+        // Flush in-flight turn on stream end.
         if hadVoice {
-            // Close any open segment.
-            if !currentSegSamples.isEmpty {
+            if currentSegSampleCount > 0 {
                 voicedSegments.append(VoicedSegment(
-                    samples: currentSegSamples,
                     startSample: currentSegStart,
-                    endSample: cumulativeSamples
+                    endSample: cumulativeSamples,
+                    sampleCount: currentSegSampleCount
                 ))
             }
-
             SherpaOnnxOnlineStreamInputFinished(stream)
             while SherpaOnnxIsOnlineStreamReady(recognizer, stream) != 0 {
                 SherpaOnnxDecodeOnlineStream(recognizer, stream)
             }
-            chunkIndex += 1
             if let id = currentChunkID {
-                onChunkLifecycle?(id, source, .transcribing)
+                onChunkLifecycle?(id, source, .partial(text: lastPartialText.isEmpty ? "…" : lastPartialText))
             }
             let text: String
             if let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) {
@@ -429,84 +417,64 @@ final class SherpaTranscriber: Transcriber {
 
     // MARK: — Worker
 
-    /// Assigns speaker labels per voiced segment, splits the text if the
-    /// speaker changes mid-turn, and fires lifecycle events — one per
-    /// speaker group. No speaker label is included in the emitted text.
+    /// Splits the turn at VAD silence gaps ≥ `vadSplitGapSamples`, then
+    /// emits one `.completed` per group. No speaker labels in the text.
     private func processTurn(
         turn: TurnRecord,
         source: SourceTag,
         continuation: AsyncThrowingStream<SessionSnapshot, Error>.Continuation
     ) {
         guard !turn.text.isEmpty else {
-            Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index) empty text → dropped")
+            Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index) empty → dropped")
             onChunkLifecycle?(turn.chunkID, source, .dropped)
             return
         }
 
-        // --- Build speaker groups ---
-        // Run campplus embedding on each voiced segment (≥ minEmbeddingSamples).
-        // Short segments inherit the preceding group's speaker to avoid
-        // unreliable embeddings on sub-100ms noise bursts.
-        struct SpeakerGroup {
-            let speaker: String
-            var sampleCount: Int
+        // Group voiced segments: merge adjacent ones whose gap is < threshold,
+        // start a new group when the silence gap reaches the split threshold.
+        struct SegGroup {
             let startSample: Int
             var endSample: Int
+            var sampleCount: Int
         }
-
-        var groups: [SpeakerGroup] = []
-
-        for seg in turn.voicedSegments {
-            let label: String
-            if seg.samples.count >= Self.minEmbeddingSamples, let tracker = speakerTracker {
-                label = tracker.label(for: seg.samples)
+        var groups: [SegGroup] = []
+        for (i, seg) in turn.voicedSegments.enumerated() {
+            if !groups.isEmpty {
+                let gap = seg.startSample - turn.voicedSegments[i - 1].endSample
+                if gap >= Self.vadSplitGapSamples {
+                    groups.append(SegGroup(startSample: seg.startSample,
+                                           endSample: seg.endSample,
+                                           sampleCount: seg.sampleCount))
+                    continue
+                }
             } else {
-                // Too short for reliable embedding — inherit previous speaker.
-                label = groups.last?.speaker ?? {
-                    // Very first segment and it's short — run embedding anyway
-                    // (worst case SpeakerTracker returns "Speaker ?", which is
-                    // benign: it won't match any known speaker, so a new entry
-                    // is created, but that's acceptable for the first segment).
-                    speakerTracker?.label(for: seg.samples) ?? "Speaker 1"
-                }()
+                groups.append(SegGroup(startSample: seg.startSample,
+                                       endSample: seg.endSample,
+                                       sampleCount: seg.sampleCount))
+                continue
             }
-
-            if let last = groups.last, last.speaker == label {
-                groups[groups.count - 1].sampleCount += seg.samples.count
-                groups[groups.count - 1].endSample    = seg.endSample
-            } else {
-                groups.append(SpeakerGroup(
-                    speaker: label,
-                    sampleCount: seg.samples.count,
-                    startSample: seg.startSample,
-                    endSample: seg.endSample
-                ))
-            }
+            groups[groups.count - 1].endSample = seg.endSample
+            groups[groups.count - 1].sampleCount += seg.sampleCount
         }
-
-        // If no segments were recorded (edge case), treat as single-speaker.
         if groups.isEmpty {
-            groups = [SpeakerGroup(
-                speaker: speakerTracker?.label(for: []) ?? "Speaker 1",
-                sampleCount: 0,
-                startSample: turn.startSample,
-                endSample: turn.endSample
-            )]
+            groups = [SegGroup(startSample: turn.startSample,
+                               endSample: turn.endSample,
+                               sampleCount: 1)]
         }
 
-        // --- Emit chunks (one per speaker group) ---
+        // Fast path: single group — no split.
         if groups.count == 1 {
-            // Fast path: no split needed.
-            let startSeconds = Double(turn.startSample) / 16_000
-            let endSeconds   = Double(turn.endSample)   / 16_000
-            Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index) \(groups[0].speaker) → \"\(turn.text.prefix(60))\"")
+            let g = groups[0]
+            Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index) → \"\(turn.text.prefix(60))\"")
             emit(chunkID: turn.chunkID, source: source, text: turn.text,
-                 startSeconds: startSeconds, endSeconds: endSeconds,
+                 startSeconds: Double(turn.startSample) / 16_000,
+                 endSeconds:   Double(turn.endSample)   / 16_000,
                  continuation: continuation)
+            _ = g  // suppress unused warning
             return
         }
 
-        // Multiple speakers: split the text proportionally by voiced audio.
+        // Multiple groups: split text proportionally by voiced sample count.
         let words = turn.text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
         guard !words.isEmpty else {
             onChunkLifecycle?(turn.chunkID, source, .dropped)
@@ -515,45 +483,36 @@ final class SherpaTranscriber: Transcriber {
 
         let totalSamples = groups.reduce(0) { $0 + $1.sampleCount }
         var wordOffset = 0
-        var cumulativeSamples = 0
+        var cumSamples = 0
 
         for (gi, group) in groups.enumerated() {
-            cumulativeSamples += group.sampleCount
+            cumSamples += group.sampleCount
             let isLast = gi == groups.count - 1
 
             let wordEnd: Int
             if isLast || wordOffset >= words.count {
                 wordEnd = words.count
             } else {
-                let proportion = Double(cumulativeSamples) / Double(max(totalSamples, 1))
+                let proportion = Double(cumSamples) / Double(max(totalSamples, 1))
                 let ideal = Int((proportion * Double(words.count)).rounded())
-                // Reserve at least one word for each remaining group.
-                let remainingGroups = groups.count - gi - 1
-                wordEnd = max(wordOffset + 1, min(ideal, words.count - remainingGroups))
+                let remaining = groups.count - gi - 1
+                wordEnd = max(wordOffset + 1, min(ideal, words.count - remaining))
             }
 
             guard wordOffset < words.count else { break }
             let groupText = words[wordOffset..<wordEnd].joined(separator: " ")
             wordOffset = wordEnd
-
             guard !groupText.isEmpty else { continue }
 
-            let startSeconds = Double(group.startSample) / 16_000
-            let endSeconds   = Double(group.endSample)   / 16_000
-            // First group reuses the original chunkID (it already has a
-            // .listening row in the UI). Additional groups get fresh UUIDs;
-            // Pipeline's applyLifecycle handles .completed for unknown IDs
-            // gracefully — they graduate directly to sentences.
             let chunkID = gi == 0 ? turn.chunkID : UUID()
-
-            Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index).\(gi+1) \(group.speaker) → \"\(groupText.prefix(60))\"")
+            Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index).\(gi+1) split → \"\(groupText.prefix(60))\"")
             emit(chunkID: chunkID, source: source, text: groupText,
-                 startSeconds: startSeconds, endSeconds: endSeconds,
+                 startSeconds: Double(group.startSample) / 16_000,
+                 endSeconds:   Double(group.endSample)   / 16_000,
                  continuation: continuation)
         }
     }
 
-    /// Fire `.completed` and yield a `SessionSnapshot` for one speaker group.
     private func emit(
         chunkID: UUID, source: SourceTag, text: String,
         startSeconds: Double, endSeconds: Double,
@@ -563,24 +522,19 @@ final class SherpaTranscriber: Transcriber {
             text: text, startSeconds: startSeconds, endSeconds: endSeconds
         ))
         continuation.yield(SessionSnapshot(sentences: [
-            SessionSentence(
-                text: text, isFinal: true,
-                startSeconds: startSeconds, endSeconds: endSeconds
-            )
+            SessionSentence(text: text, isFinal: true,
+                            startSeconds: startSeconds, endSeconds: endSeconds)
         ]))
     }
 
     // MARK: — Helpers
 
-    /// Build a Silero-VAD instance from the bundled model. Returns nil when
-    /// the model file is absent (we fall back to RMS-based detection).
     private func makeVAD() -> OpaquePointer? {
         let vadPath = resourcePath(ModelConfig.vadModel)
         guard FileManager.default.fileExists(atPath: vadPath) else {
             Log.line("SherpaTranscriber: VAD model not in bundle, using RMS fallback")
             return nil
         }
-        let vadURL = URL(fileURLWithPath: vadPath)
         var silero = SherpaOnnxSileroVadModelConfig()
         memset_zero(&silero)
         silero.threshold            = 0.5
@@ -594,7 +548,7 @@ final class SherpaTranscriber: Transcriber {
         vadCfg.num_threads = 1
         vadCfg.debug       = 0
 
-        let path     = vadURL.path
+        let path     = vadPath
         let provider = ModelConfig.provider
 
         return path.withCString { cPath -> OpaquePointer? in
@@ -602,15 +556,11 @@ final class SherpaTranscriber: Transcriber {
             vadCfg.silero_vad = silero
             return provider.withCString { cProv -> OpaquePointer? in
                 vadCfg.provider = cProv
-                // bufferSizeInSeconds: 30 s window keeps the VAD
-                // state warm for the whole run.
                 return SherpaOnnxCreateVoiceActivityDetector(&vadCfg, 30)
             }
         }
     }
 
-    /// Absolute path to a bundled resource given its bundle-relative name
-    /// (e.g. `"sherpa-onnx-streaming-zipformer-de.../encoder.onnx"`).
     private func resourcePath(_ relativeName: String) -> String {
         Bundle.main.bundleURL
             .appendingPathComponent("Contents/Resources")
@@ -640,7 +590,6 @@ enum TranscribeError: LocalizedError {
 
 // MARK: — Zero-init helper
 
-/// Fill a Swift struct with zeros (equivalent to `memset(&v, 0, sizeof(v))`).
 private func memset_zero<T>(_ value: inout T) {
     withUnsafeMutableBytes(of: &value) {
         _ = $0.initializeMemory(as: UInt8.self, repeating: 0)

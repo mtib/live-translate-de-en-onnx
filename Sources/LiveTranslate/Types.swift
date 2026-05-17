@@ -73,9 +73,12 @@ struct InflightChunk: Identifiable, Equatable {
     var state: State
 
     enum State: Equatable {
-        case listening      // accumulator has voice onset, chunk not yet closed
-        case transcribing   // chunk closed, whisper running
-        case translating(text: String)  // whisper done, translator running
+        case listening          // voice onset, no ASR output yet
+        /// Live partial hypothesis from the streaming recognizer. Shows the
+        /// current text (and translation when the 1 s throttle has fired)
+        /// so the UI rolls forward instead of sitting on "transcribing".
+        case partial(text: String, translation: String?)
+        case translating(text: String)  // endpoint closed, final translation running
     }
 }
 

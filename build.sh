@@ -60,8 +60,6 @@ fi
 
 # ── ONNX models into Resources/ ─────────────────────────────────────────────
 cp "${MODELS_DIR}/silero_vad.onnx"          "${APP_DIR}/Contents/Resources/"
-cp "${MODELS_DIR}/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx" \
-                                             "${APP_DIR}/Contents/Resources/"
 
 # German ASR model directory
 ASR_DIR="${MODELS_DIR}/sherpa-onnx-streaming-zipformer-de-kroko-2025-08-06"

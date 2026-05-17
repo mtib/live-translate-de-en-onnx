@@ -3,7 +3,6 @@
 # the German→English pipeline:
 #   - Silero-VAD
 #   - German streaming zipformer ASR (sherpa-onnx-streaming-zipformer-de-kroko-2025-08-06)
-#   - campplus speaker embedding (English-compatible, 28 MB)
 #   - kitten-mini-en-v0_8 TTS
 #
 # Idempotent — skips anything already on disk.
@@ -63,18 +62,6 @@ if [[ ! -d "${DE_DIR}" ]]; then
   echo "✓ German ASR: ${DE_DIR}/"
 else
   echo "✓ German ASR model already present"
-fi
-
-# ── campplus speaker embedding (English-compatible, 28 MB) ──────────────────
-SPKR_MODEL="${MODELS_DIR}/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx"
-if [[ ! -f "${SPKR_MODEL}" ]]; then
-  echo "→ downloading campplus speaker embedding"
-  curl -L --fail --progress-bar \
-    -o "${SPKR_MODEL}" \
-    "${BASE}/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx"
-  echo "✓ campplus speaker model"
-else
-  echo "✓ campplus speaker model already present"
 fi
 
 # ── kitten-mini TTS ──────────────────────────────────────────────────────────

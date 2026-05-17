@@ -1,4 +1,4 @@
-/// Compile-time constants for ASR / VAD / speaker / TTS models.
+/// Compile-time constants for ASR / VAD / TTS models.
 ///
 /// Language pair is fixed at build time — default: German → English.
 /// Model file names are relative to the app bundle's Resources/ directory
@@ -32,11 +32,6 @@ enum ModelConfig {
     // MARK: — VAD  (Silero-VAD)
 
     static let vadModel = "silero_vad.onnx"
-
-    // MARK: — Speaker embedding  (campplus, English-compatible, 28 MB)
-
-    static let speakerModel =
-        "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx"
 
     // MARK: — TTS  (kitten-mini-en-v0_8)
 

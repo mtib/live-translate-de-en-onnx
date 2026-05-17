@@ -141,7 +141,7 @@ final class OnnxTTSSpeaker: @unchecked Sendable {
 
         var genCfg = SherpaOnnxGenerationConfig()
         genCfg.speed  = 1.0
-        genCfg.sid    = 0
+        genCfg.sid    = 2   // expr-voice-3-m
 
         guard let audio = text.withCString({ cText -> UnsafePointer<SherpaOnnxGeneratedAudio>? in
             withUnsafeMutablePointer(to: &genCfg) { cfgPtr in
