@@ -307,8 +307,9 @@ final class SherpaTranscriber: Transcriber {
                         // a fresh chunk for the next speaker / utterance.
                         let h: String
                         if let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) {
-                            h = String(cString: result.pointee.text)
-                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            h = normalizeHypothesis(
+                                String(cString: result.pointee.text)
+                                    .trimmingCharacters(in: .whitespacesAndNewlines))
                             SherpaOnnxDestroyOnlineRecognizerResult(result)
                         } else { h = "" }
                         let splitRemainder = committedLength == 0 ? h
@@ -351,8 +352,9 @@ final class SherpaTranscriber: Transcriber {
             // and a sentence boundary (`. ` after a letter) is found.
             if hadVoice, let id = currentChunkID,
                let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) {
-                let hypothesis = String(cString: result.pointee.text)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let hypothesis = normalizeHypothesis(
+                    String(cString: result.pointee.text)
+                        .trimmingCharacters(in: .whitespacesAndNewlines))
                 SherpaOnnxDestroyOnlineRecognizerResult(result)
 
                 if !hypothesis.isEmpty && hypothesis != lastPartialText {
@@ -402,8 +404,9 @@ final class SherpaTranscriber: Transcriber {
                 // *** Read text BEFORE reset ***
                 let fullText: String
                 if let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) {
-                    fullText = String(cString: result.pointee.text)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    fullText = normalizeHypothesis(
+                        String(cString: result.pointee.text)
+                            .trimmingCharacters(in: .whitespacesAndNewlines))
                     SherpaOnnxDestroyOnlineRecognizerResult(result)
                 } else {
                     fullText = ""
@@ -453,8 +456,9 @@ final class SherpaTranscriber: Transcriber {
             }
             let fullText: String
             if let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) {
-                fullText = String(cString: result.pointee.text)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                fullText = normalizeHypothesis(
+                    String(cString: result.pointee.text)
+                        .trimmingCharacters(in: .whitespacesAndNewlines))
                 SherpaOnnxDestroyOnlineRecognizerResult(result)
             } else {
                 fullText = ""
@@ -592,6 +596,19 @@ final class SherpaTranscriber: Transcriber {
                 return SherpaOnnxCreateVoiceActivityDetector(&vadCfg, 30)
             }
         }
+    }
+
+    /// Strip leading sentence-ending punctuation and spaces from an ASR
+    /// hypothesis. The German zipformer model sometimes prepends ". " (or
+    /// "? " / "! ") to the first hypothesis of a new stream after a reset,
+    /// indicating that the prior sentence ended — but that punctuation belongs
+    /// to the previous row, not this one.
+    private func normalizeHypothesis(_ text: String) -> String {
+        var s = text
+        while let first = s.first, ".?! ".contains(first) {
+            s = String(s.dropFirst())
+        }
+        return s
     }
 
     private func resourcePath(_ relativeName: String) -> String {
