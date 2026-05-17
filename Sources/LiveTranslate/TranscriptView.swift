@@ -252,6 +252,11 @@ struct TranscriptView: View {
                     proxy.scrollTo("BOTTOM", anchor: .bottom)
                 }
             }
+            // Partial text grows the last inflight row — scroll to keep
+            // the bottom visible as height changes.
+            .onChange(of: pipeline.inflightChunks) { _, _ in
+                proxy.scrollTo("BOTTOM", anchor: .bottom)
+            }
         }
     }
 }
@@ -288,16 +293,15 @@ private struct SentenceRow: View {
     }
 }
 
-/// In-flight chunk row. Lifecycle:
-///   `.listening`  → shows "listening"
-///   `.partial`    → shows the live ASR partial (or its translation once the
-///                   1 s throttle has fired); same italic/secondary style so
-///                   it's visually distinct from graduated sentences
-///   `.translating`→ shows "translating" + source text in caption
+/// In-flight chunk row. Three visual states:
+///   `.listening`              → italic secondary "listening" placeholder
+///   `.partial(text, nil)`     → italic secondary raw ASR text (no translation yet)
+///   `.partial(text, transl)`  → **same style as SentenceRow**: primary translation,
+///                               secondary caption with source text
+///   `.translating(text)`      → italic secondary "translating" + source caption
 ///
-/// The layout always matches `SentenceRow` (same icon width, same VStack
-/// structure) so SwiftUI's row-swap animation is smooth when a chunk
-/// graduates and the inflight row is replaced by the final sentence.
+/// Using SentenceRow styling as soon as a translation is available means the
+/// row looks identical to its graduated form — the swap animation is invisible.
 private struct InflightRow: View {
     let chunk: InflightChunk
     let compact: Bool
@@ -311,8 +315,8 @@ private struct InflightRow: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(primaryText)
                     .font(compact ? .callout : .body)
-                    .italic()
-                    .foregroundStyle(.secondary)
+                    .italic(isStateWord)
+                    .foregroundStyle(isStateWord ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
                 if !compact, let cap = captionText {
@@ -326,27 +330,27 @@ private struct InflightRow: View {
         }
     }
 
-    /// The main line. For `.partial` we show the translation when available
-    /// (mirrors what a graduated `SentenceRow` shows), falling back to the
-    /// raw ASR text. For other states we show a state word.
-    private var primaryText: String {
+    /// True when `primaryText` is a placeholder word, not real content.
+    private var isStateWord: Bool {
         switch chunk.state {
-        case .listening:   return "listening"
-        case .partial(let text, let translation): return translation ?? text
-        case .translating: return "translating"
+        case .partial(_, let translation): return translation == nil
+        default: return true
         }
     }
 
-    /// Caption line (full mode only): source text when we're showing its
-    /// translation, so the layout mirrors a graduated SentenceRow.
+    private var primaryText: String {
+        switch chunk.state {
+        case .listening:                              return "listening"
+        case .partial(let text, let translation):    return translation ?? text
+        case .translating:                            return "translating"
+        }
+    }
+
     private var captionText: String? {
         switch chunk.state {
-        case .partial(let text, let translation):
-            return translation != nil ? text : nil
-        case .translating(let text):
-            return text
-        default:
-            return nil
+        case .partial(let text, let translation):    return translation != nil ? text : nil
+        case .translating(let text):                 return text
+        default:                                     return nil
         }
     }
 }
