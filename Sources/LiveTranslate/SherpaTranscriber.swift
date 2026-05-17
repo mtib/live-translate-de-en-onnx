@@ -13,9 +13,9 @@ import CSherpaOnnx
 ///   5. As ASR emits tokens, fire `.partial(text:)` so the UI shows live text.
 ///      The shown text is always the *active* portion of the hypothesis —
 ///      everything after the last mid-turn force-completion boundary.
-///   6. Mid-turn sentence cap: once the active portion exceeds `maxWordsPerRow`
-///      words the accumulator watches incoming characters for `. ` (period +
-///      space where the char before the period is a letter, not a digit).
+///   6. Mid-turn sentence cap: once the active portion exceeds `maxCharsPerRow`
+///      characters the accumulator watches for `. `, `? `, or `! ` boundaries.
+///      For `.` the char before it must be a letter (skips decimals, versions).
 ///      When found it immediately fires `.completed` for the current chunk
 ///      (the text up to and including the period) and starts a fresh chunk for
 ///      the remainder. This keeps rows stable — no retroactive rewrites.
@@ -42,9 +42,10 @@ final class SherpaTranscriber: Transcriber {
     /// leaving typical within-sentence clause pauses intact.
     private static let vadSplitGapSamples: Int = Int(0.5 * 16_000)
 
-    /// Once the active partial exceeds this many words the accumulator starts
-    /// looking for a `. ` sentence boundary to force-complete the row.
-    static let maxWordsPerRow = 20
+    /// Once the active partial exceeds this many characters the accumulator
+    /// looks for a sentence-ending punctuation boundary (`. `, `? `, `! `)
+    /// to force-complete the row so translation and TTS can start promptly.
+    static let maxCharsPerRow = 100
 
     // MARK: — Shared recognizer (loaded once, reused)
 
@@ -348,10 +349,7 @@ final class SherpaTranscriber: Transcriber {
                         ? hypothesis
                         : String(hypothesis.dropFirst(clampedCommit))
 
-                    let wordCount = active.split(separator: " ",
-                        omittingEmptySubsequences: true).count
-
-                    if wordCount > Self.maxWordsPerRow,
+                    if active.count > Self.maxCharsPerRow,
                        let dotIdx = sentenceBoundary(in: active) {
                         // Force-complete: text up to and including ".".
                         let afterDot   = active.index(after: dotIdx) // index of " "
@@ -606,25 +604,41 @@ final class SherpaTranscriber: Transcriber {
         ]))
     }
 
-    /// Find the first `. ` sentence boundary in `text` where the character
-    /// immediately before the `.` is a Unicode letter (not a digit, so
-    /// "3.14 " and "v1.2 " are skipped; abbreviations like "e.g. " where
-    /// the next word is lowercase are not specifically filtered but are
-    /// rare in German live transcription).
-    /// Returns the `String.Index` of the `.` itself, or nil if none found.
+    /// Find the earliest sentence-ending boundary in `text` that is followed
+    /// by a space, returning the index of the punctuation character itself.
+    ///
+    /// Recognised patterns:
+    ///   - `. ` — only where the character before `.` is a letter, to skip
+    ///            decimals ("3.14 "), version numbers ("v1.2 "), etc.
+    ///   - `? ` — always (unambiguous sentence end)
+    ///   - `! ` — always (unambiguous sentence end)
+    ///
+    /// Returns the earliest such index, or nil if none found.
     private func sentenceBoundary(in text: String) -> String.Index? {
+        var result: String.Index? = nil
+
+        // ". " — only after a letter character
         var search = text.startIndex
         while let range = text.range(of: ". ", range: search..<text.endIndex) {
             let dot = range.lowerBound
-            if dot > text.startIndex {
-                let before = text.index(before: dot)
-                if text[before].isLetter {
-                    return dot
-                }
+            if dot > text.startIndex && text[text.index(before: dot)].isLetter {
+                result = dot
+                break
             }
             search = text.index(after: range.lowerBound)
         }
-        return nil
+
+        // "? " — unambiguous; keep if earlier than current best
+        if let r = text.range(of: "? ") {
+            if result == nil || r.lowerBound < result! { result = r.lowerBound }
+        }
+
+        // "! " — unambiguous; keep if earlier than current best
+        if let r = text.range(of: "! ") {
+            if result == nil || r.lowerBound < result! { result = r.lowerBound }
+        }
+
+        return result
     }
 
     // MARK: — Helpers
