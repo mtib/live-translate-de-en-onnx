@@ -10,16 +10,17 @@ import CSherpaOnnx
 ///   2. Resample to 16 kHz (AVAudioConverter, persistent across buffers).
 ///   3. Push samples into a Silero-VAD instance for voiced/silence detection.
 ///   4. Push voiced samples into the sherpa-onnx streaming recognizer.
-///   5. As ASR emits tokens, fire `.partial(text:)` lifecycle events so the
-///      UI updates with live text instead of showing "transcribing".
-///   6. On each endpoint (≥1 s trailing silence), read the committed text
-///      BEFORE resetting the stream, then split it into groups wherever the
-///      VAD showed a silence gap ≥ 0.5 s — each group becomes a separate row.
-///
-/// **Speaker diarization removed.** Rows are split by VAD silence gaps alone,
-/// not by campplus embedding. This avoids the campplus latency and the
-/// proportional-text-split approximation while still cleanly separating most
-/// speaker turns in natural conversation.
+///   5. As ASR emits tokens, fire `.partial(text:)` so the UI shows live text.
+///      The shown text is always the *active* portion of the hypothesis —
+///      everything after the last mid-turn force-completion boundary.
+///   6. Mid-turn sentence cap: once the active portion exceeds `maxWordsPerRow`
+///      words the accumulator watches incoming characters for `. ` (period +
+///      space where the char before the period is a letter, not a digit).
+///      When found it immediately fires `.completed` for the current chunk
+///      (the text up to and including the period) and starts a fresh chunk for
+///      the remainder. This keeps rows stable — no retroactive rewrites.
+///   7. On endpoint (≥1 s trailing silence), only the *uncommitted* remainder
+///      text is sent to the worker for VAD-gap splitting and final emission.
 ///
 /// **Crosstalk suppression:** `markSystemVoiced` / `isSystemRecentlyVoiced`
 /// — mic buffers are zeroed when system audio was recently heard.
@@ -40,6 +41,10 @@ final class SherpaTranscriber: Transcriber {
     /// 0.5 s is long enough to catch most speaker-turn boundaries while
     /// leaving typical within-sentence clause pauses intact.
     private static let vadSplitGapSamples: Int = Int(0.5 * 16_000)
+
+    /// Once the active partial exceeds this many words the accumulator starts
+    /// looking for a `. ` sentence boundary to force-complete the row.
+    static let maxWordsPerRow = 20
 
     // MARK: — Shared recognizer (loaded once, reused)
 
@@ -252,8 +257,12 @@ final class SherpaTranscriber: Transcriber {
         var currentSegSampleCount = 0
         var prevVoiced = false
 
-        // Partial-text dedup.
+        // Partial-text dedup and mid-turn force-completion state.
         var lastPartialText = ""
+        /// How many characters of the full ASR hypothesis have already been
+        /// force-completed into earlier rows this turn. The "active" portion
+        /// of any new hypothesis is `hypothesis[committedLength...]`.
+        var committedLength = 0
 
         Log.line("SherpaTranscriber[\(tag)]: accumulator started")
 
@@ -322,15 +331,56 @@ final class SherpaTranscriber: Transcriber {
                 SherpaOnnxDecodeOnlineStream(recognizer, stream)
             }
 
-            // Emit partial text whenever the hypothesis changes.
+            // Emit partial text whenever the hypothesis changes, and
+            // force-complete the current row when it passes maxWordsPerRow
+            // and a sentence boundary (`. ` after a letter) is found.
             if hadVoice, let id = currentChunkID,
                let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) {
-                let partial = String(cString: result.pointee.text)
+                let hypothesis = String(cString: result.pointee.text)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 SherpaOnnxDestroyOnlineRecognizerResult(result)
-                if !partial.isEmpty && partial != lastPartialText {
-                    lastPartialText = partial
-                    onChunkLifecycle?(id, source, .partial(text: partial))
+
+                if !hypothesis.isEmpty && hypothesis != lastPartialText {
+                    lastPartialText = hypothesis
+                    // Active portion = everything not yet force-completed.
+                    let clampedCommit = min(committedLength, hypothesis.count)
+                    let active = clampedCommit == 0
+                        ? hypothesis
+                        : String(hypothesis.dropFirst(clampedCommit))
+
+                    let wordCount = active.split(separator: " ",
+                        omittingEmptySubsequences: true).count
+
+                    if wordCount > Self.maxWordsPerRow,
+                       let dotIdx = sentenceBoundary(in: active) {
+                        // Force-complete: text up to and including ".".
+                        let afterDot   = active.index(after: dotIdx) // index of " "
+                        let completed  = String(active[...dotIdx])   // ends with "."
+                        let remStart   = active.index(after: afterDot) // skip " "
+                        let remainder  = remStart < active.endIndex
+                            ? String(active[remStart...]) : ""
+
+                        let startSec = Double(turnStartSample) / 16_000
+                        let endSec   = Double(cumulativeSamples) / 16_000
+                        onChunkLifecycle?(id, source, .completed(
+                            text: completed,
+                            startSeconds: startSec, endSeconds: endSec
+                        ))
+
+                        // committedLength now covers completed + the space.
+                        committedLength = clampedCommit + completed.count + 1
+
+                        // Open a new inflight row for the remainder.
+                        let newID = UUID()
+                        currentChunkID = newID
+                        onChunkLifecycle?(newID, source, .listening)
+                        if !remainder.isEmpty {
+                            onChunkLifecycle?(newID, source, .partial(text: remainder))
+                        }
+                    } else {
+                        // Normal partial update — show the active portion.
+                        onChunkLifecycle?(id, source, .partial(text: active))
+                    }
                 }
             }
 
@@ -348,28 +398,38 @@ final class SherpaTranscriber: Transcriber {
                 }
 
                 // *** Read text BEFORE reset ***
-                let text: String
+                let fullText: String
                 if let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) {
-                    text = String(cString: result.pointee.text)
+                    fullText = String(cString: result.pointee.text)
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                     SherpaOnnxDestroyOnlineRecognizerResult(result)
                 } else {
-                    text = ""
+                    fullText = ""
                 }
+                // Only send the uncommitted remainder to the worker.
+                let remainder = committedLength == 0 ? fullText
+                    : String(fullText.dropFirst(min(committedLength, fullText.count)))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
 
-                Log.line("SherpaTranscriber[\(tag)]: endpoint chunk #\(chunkIndex) text=\"\(text.prefix(60))\"")
+                Log.line("SherpaTranscriber[\(tag)]: endpoint chunk #\(chunkIndex) remainder=\"\(remainder.prefix(60))\"")
 
-                sink.yield(TurnRecord(
-                    chunkID: currentChunkID ?? UUID(),
-                    index: chunkIndex,
-                    text: text,
-                    voicedSegments: voicedSegments,
-                    startSample: turnStartSample,
-                    endSample: cumulativeSamples
-                ))
+                if remainder.isEmpty && committedLength > 0 {
+                    // Everything was already force-completed mid-turn.
+                    onChunkLifecycle?(currentChunkID ?? UUID(), source, .dropped)
+                } else {
+                    sink.yield(TurnRecord(
+                        chunkID: currentChunkID ?? UUID(),
+                        index: chunkIndex,
+                        text: remainder.isEmpty ? fullText : remainder,
+                        voicedSegments: voicedSegments,
+                        startSample: turnStartSample,
+                        endSample: cumulativeSamples
+                    ))
+                }
 
                 SherpaOnnxOnlineStreamReset(recognizer, stream)
                 voicedSegments.removeAll(keepingCapacity: true)
+                committedLength = 0
                 turnStartSample = cumulativeSamples
                 currentChunkID = nil
                 hadVoice = false
@@ -391,25 +451,29 @@ final class SherpaTranscriber: Transcriber {
             while SherpaOnnxIsOnlineStreamReady(recognizer, stream) != 0 {
                 SherpaOnnxDecodeOnlineStream(recognizer, stream)
             }
-            if let id = currentChunkID {
-                onChunkLifecycle?(id, source, .partial(text: lastPartialText.isEmpty ? "…" : lastPartialText))
-            }
-            let text: String
+            let fullText: String
             if let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) {
-                text = String(cString: result.pointee.text)
+                fullText = String(cString: result.pointee.text)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 SherpaOnnxDestroyOnlineRecognizerResult(result)
             } else {
-                text = ""
+                fullText = ""
             }
-            sink.yield(TurnRecord(
-                chunkID: currentChunkID ?? UUID(),
-                index: chunkIndex,
-                text: text,
-                voicedSegments: voicedSegments,
-                startSample: turnStartSample,
-                endSample: cumulativeSamples
-            ))
+            let remainder = committedLength == 0 ? fullText
+                : String(fullText.dropFirst(min(committedLength, fullText.count)))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            if remainder.isEmpty && committedLength > 0 {
+                onChunkLifecycle?(currentChunkID ?? UUID(), source, .dropped)
+            } else {
+                sink.yield(TurnRecord(
+                    chunkID: currentChunkID ?? UUID(),
+                    index: chunkIndex,
+                    text: remainder.isEmpty ? fullText : remainder,
+                    voicedSegments: voicedSegments,
+                    startSample: turnStartSample,
+                    endSample: cumulativeSamples
+                ))
+            }
         }
 
         Log.line("SherpaTranscriber[\(tag)]: accumulator exited (chunks=\(chunkIndex))")
@@ -417,13 +481,10 @@ final class SherpaTranscriber: Transcriber {
 
     // MARK: — Worker
 
-    /// Maximum words per emitted row. When a group's text exceeds this,
-    /// `emitGroup` splits at the next ". " boundary past the cap.
-    private static let maxWordsPerRow = 20
-
-    /// Splits the turn at VAD silence gaps ≥ `vadSplitGapSamples`, then
-    /// emits one row per group (further split at sentence boundaries if
-    /// a group exceeds `maxWordsPerRow`).
+    /// Splits the turn at VAD silence gaps ≥ `vadSplitGapSamples` and emits
+    /// one row per group. Sentence-boundary capping is handled mid-turn by
+    /// the accumulator (force-completions), so the remainder text arriving
+    /// here is already reasonably short.
     private func processTurn(
         turn: TurnRecord,
         source: SourceTag,
@@ -469,10 +530,10 @@ final class SherpaTranscriber: Transcriber {
         // Fast path: single group.
         if groups.count == 1 {
             Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index) → \"\(turn.text.prefix(60))\"")
-            emitGroup(firstChunkID: turn.chunkID, source: source, text: turn.text,
-                      startSeconds: Double(turn.startSample) / 16_000,
-                      endSeconds:   Double(turn.endSample)   / 16_000,
-                      continuation: continuation)
+            emit(chunkID: turn.chunkID, source: source, text: turn.text,
+                 startSeconds: Double(turn.startSample) / 16_000,
+                 endSeconds:   Double(turn.endSample)   / 16_000,
+                 continuation: continuation)
             return
         }
 
@@ -508,40 +569,10 @@ final class SherpaTranscriber: Transcriber {
 
             let chunkID = gi == 0 ? turn.chunkID : UUID()
             Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index).\(gi+1) split → \"\(groupText.prefix(60))\"")
-            emitGroup(firstChunkID: chunkID, source: source, text: groupText,
-                      startSeconds: Double(group.startSample) / 16_000,
-                      endSeconds:   Double(group.endSample)   / 16_000,
-                      continuation: continuation)
-        }
-    }
-
-    /// Emit one group of text, further splitting at ". " boundaries if the
-    /// group exceeds `maxWordsPerRow`. Timing is distributed proportionally
-    /// by word count across the sub-sentences.
-    /// `firstChunkID` is reused for the first sub-sentence; subsequent ones
-    /// get fresh UUIDs (Pipeline handles unknown IDs gracefully).
-    private func emitGroup(
-        firstChunkID: UUID, source: SourceTag, text: String,
-        startSeconds: Double, endSeconds: Double,
-        continuation: AsyncThrowingStream<SessionSnapshot, Error>.Continuation
-    ) {
-        let parts = splitAtSentenceBoundaries(text, maxWords: Self.maxWordsPerRow)
-        let wordCounts = parts.map { $0.split(separator: " ", omittingEmptySubsequences: true).count }
-        let totalWords = wordCounts.reduce(0, +)
-        let duration = endSeconds - startSeconds
-
-        var t = startSeconds
-        var cumWords = 0
-        for (i, part) in parts.enumerated() {
-            cumWords += wordCounts[i]
-            let end = i == parts.count - 1
-                ? endSeconds
-                : startSeconds + duration * Double(cumWords) / Double(max(totalWords, 1))
-            emit(chunkID: i == 0 ? firstChunkID : UUID(),
-                 source: source, text: part,
-                 startSeconds: t, endSeconds: end,
+            emit(chunkID: chunkID, source: source, text: groupText,
+                 startSeconds: Double(group.startSample) / 16_000,
+                 endSeconds:   Double(group.endSample)   / 16_000,
                  continuation: continuation)
-            t = end
         }
     }
 
@@ -559,23 +590,25 @@ final class SherpaTranscriber: Transcriber {
         ]))
     }
 
-    /// Split `text` into parts of ≤ `maxWords` words, breaking only at word
-    /// boundaries where the preceding word ends with ".". If no such boundary
-    /// exists past the cap, the whole text is returned as one part.
-    private func splitAtSentenceBoundaries(_ text: String, maxWords: Int) -> [String] {
-        let words = text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-        guard words.count > maxWords else { return [text] }
-        var result: [String] = []
-        var current: [String] = []
-        for word in words {
-            current.append(word)
-            if current.count >= maxWords && word.hasSuffix(".") {
-                result.append(current.joined(separator: " "))
-                current = []
+    /// Find the first `. ` sentence boundary in `text` where the character
+    /// immediately before the `.` is a Unicode letter (not a digit, so
+    /// "3.14 " and "v1.2 " are skipped; abbreviations like "e.g. " where
+    /// the next word is lowercase are not specifically filtered but are
+    /// rare in German live transcription).
+    /// Returns the `String.Index` of the `.` itself, or nil if none found.
+    private func sentenceBoundary(in text: String) -> String.Index? {
+        var search = text.startIndex
+        while let range = text.range(of: ". ", range: search..<text.endIndex) {
+            let dot = range.lowerBound
+            if dot > text.startIndex {
+                let before = text.index(before: dot)
+                if text[before].isLetter {
+                    return dot
+                }
             }
+            search = text.index(after: range.lowerBound)
         }
-        if !current.isEmpty { result.append(current.joined(separator: " ")) }
-        return result
+        return nil
     }
 
     // MARK: — Helpers
