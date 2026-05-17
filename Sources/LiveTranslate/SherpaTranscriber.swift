@@ -51,7 +51,7 @@ final class SherpaTranscriber: Transcriber {
     /// Once the active partial exceeds this many characters the accumulator
     /// looks for a sentence-ending punctuation boundary (`. `, `? `, `! `)
     /// to force-complete the row so translation and TTS can start promptly.
-    static let maxCharsPerRow = 100
+    static let maxCharsPerRow = 30
 
     // MARK: — Shared recognizer (loaded once, reused)
 
