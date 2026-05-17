@@ -37,16 +37,11 @@ final class SherpaTranscriber: Transcriber {
     /// How long after system-voiced we keep treating mic as contaminated.
     static let crosstalkPersistSeconds: TimeInterval = 0.25
 
-    /// Silence gap between two voiced segments that triggers a row split.
-    /// 0.8 s sits just under the 1.0 s ASR endpoint threshold so only
-    /// genuine between-utterance pauses split rows; shorter breath/clause
-    /// pauses are left intact.
+    /// Silence gap that triggers a speaker-boundary row split mid-turn.
+    /// Detected in the accumulator at each new voiced onset: if silence since
+    /// the last voiced segment is ≥ this threshold the current hypothesis is
+    /// force-completed and a fresh chunk begins — no word-distribution needed.
     private static let vadSplitGapSamples: Int = Int(0.8 * 16_000)
-
-    /// Minimum words each split group must receive. If the available words
-    /// can't satisfy this for every group, the split is skipped and the
-    /// whole text is emitted as one row to avoid single-word burst rows.
-    private static let minWordsPerVadGroup = 4
 
     /// Once the active partial exceeds this many characters the accumulator
     /// looks for a sentence-ending punctuation boundary (`. `, `? `, `! `)
@@ -181,21 +176,10 @@ final class SherpaTranscriber: Transcriber {
 
     // MARK: — Internal data models
 
-    /// A contiguous voiced interval bounded by VAD-detected silence.
-    /// The accumulator records one per voiced run within a turn so that
-    /// `processTurn` can split the endpoint text at silence gaps ≥ the
-    /// `vadSplitGapSamples` threshold.
-    private struct VoicedSegment: Sendable {
-        let startSample: Int   // cumulative 16 kHz offset at segment onset
-        let endSample: Int     // cumulative 16 kHz offset at segment end
-        let sampleCount: Int   // voiced samples in this segment (for proportion)
-    }
-
     private struct TurnRecord: Sendable {
         let chunkID: UUID
         let index: Int
         let text: String
-        let voicedSegments: [VoicedSegment]
         let startSample: Int
         let endSample: Int
     }
@@ -258,10 +242,9 @@ final class SherpaTranscriber: Transcriber {
         var currentChunkID: UUID? = nil
         var hadVoice = false
 
-        // Voiced-segment tracking (for VAD-gap splitting at endpoint).
-        var voicedSegments: [VoicedSegment] = []
-        var currentSegStart = 0
-        var currentSegSampleCount = 0
+        // Gap-split tracking: sample at which the last voiced segment ended,
+        // used to detect speaker-boundary silences at the next voiced onset.
+        var lastVoicedEndSample = 0
         var prevVoiced = false
 
         // Partial-text dedup and mid-turn force-completion state.
@@ -308,6 +291,7 @@ final class SherpaTranscriber: Transcriber {
 
             if voiced {
                 if !hadVoice {
+                    // First voiced onset of this turn.
                     let id = UUID()
                     currentChunkID = id
                     turnStartSample = samplesBefore
@@ -315,21 +299,45 @@ final class SherpaTranscriber: Transcriber {
                     Log.line("SherpaTranscriber[\(tag)]: voice onset #\(chunkIndex) (id=\(id.uuidString.prefix(8))) at \(String(format:"%.2f",Double(samplesBefore)/16_000))s")
                     onChunkLifecycle?(id, source, .listening)
                     hadVoice = true
+                } else if !prevVoiced {
+                    // New voiced onset after silence — check for speaker-boundary gap.
+                    let gap = samplesBefore - lastVoicedEndSample
+                    if gap >= Self.vadSplitGapSamples, let id = currentChunkID {
+                        // Long silence: force-complete current hypothesis and start
+                        // a fresh chunk for the next speaker / utterance.
+                        let h: String
+                        if let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) {
+                            h = String(cString: result.pointee.text)
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            SherpaOnnxDestroyOnlineRecognizerResult(result)
+                        } else { h = "" }
+                        let splitRemainder = committedLength == 0 ? h
+                            : String(h.dropFirst(min(committedLength, h.count)))
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                        let hasContent = splitRemainder.rangeOfCharacter(from: .alphanumerics) != nil
+                        if !splitRemainder.isEmpty && hasContent {
+                            Log.line("SherpaTranscriber[\(tag)]: VAD gap \(String(format:"%.2f",Double(gap)/16_000))s → splitting chunk #\(chunkIndex)")
+                            sink.yield(TurnRecord(
+                                chunkID: id, index: chunkIndex,
+                                text: splitRemainder,
+                                startSample: turnStartSample, endSample: samplesBefore
+                            ))
+                        } else {
+                            onChunkLifecycle?(id, source, .dropped)
+                        }
+                        SherpaOnnxOnlineStreamReset(recognizer, stream)
+                        committedLength = 0
+                        lastPartialText = ""
+                        turnStartSample = samplesBefore
+                        chunkIndex += 1
+                        let newID = UUID()
+                        currentChunkID = newID
+                        onChunkLifecycle?(newID, source, .listening)
+                    }
                 }
-                if !prevVoiced {
-                    // Voiced-segment onset.
-                    currentSegStart = samplesBefore
-                    currentSegSampleCount = 0
-                }
-                currentSegSampleCount += n
-            } else if prevVoiced && currentSegSampleCount > 0 {
-                // Voiced → silent: close the current segment.
-                voicedSegments.append(VoicedSegment(
-                    startSample: currentSegStart,
-                    endSample: samplesBefore,
-                    sampleCount: currentSegSampleCount
-                ))
-                currentSegSampleCount = 0
+            } else if prevVoiced {
+                // Voiced → silent transition: record when voice ended.
+                lastVoicedEndSample = samplesBefore
             }
 
             prevVoiced = voiced
@@ -390,16 +398,6 @@ final class SherpaTranscriber: Transcriber {
 
             // Endpoint check.
             if hadVoice && SherpaOnnxOnlineStreamIsEndpoint(recognizer, stream) != 0 {
-                // Close any open segment (silence caused the endpoint,
-                // so prevVoiced is likely false; guard for the edge case).
-                if currentSegSampleCount > 0 {
-                    voicedSegments.append(VoicedSegment(
-                        startSample: currentSegStart,
-                        endSample: cumulativeSamples,
-                        sampleCount: currentSegSampleCount
-                    ))
-                    currentSegSampleCount = 0
-                }
 
                 // *** Read text BEFORE reset ***
                 let fullText: String
@@ -432,14 +430,12 @@ final class SherpaTranscriber: Transcriber {
                         chunkID: currentChunkID ?? UUID(),
                         index: chunkIndex,
                         text: remainder.isEmpty ? fullText : remainder,
-                        voicedSegments: voicedSegments,
                         startSample: turnStartSample,
                         endSample: cumulativeSamples
                     ))
                 }
 
                 SherpaOnnxOnlineStreamReset(recognizer, stream)
-                voicedSegments.removeAll(keepingCapacity: true)
                 committedLength = 0
                 turnStartSample = cumulativeSamples
                 currentChunkID = nil
@@ -451,13 +447,6 @@ final class SherpaTranscriber: Transcriber {
 
         // Flush in-flight turn on stream end.
         if hadVoice {
-            if currentSegSampleCount > 0 {
-                voicedSegments.append(VoicedSegment(
-                    startSample: currentSegStart,
-                    endSample: cumulativeSamples,
-                    sampleCount: currentSegSampleCount
-                ))
-            }
             SherpaOnnxOnlineStreamInputFinished(stream)
             while SherpaOnnxIsOnlineStreamReady(recognizer, stream) != 0 {
                 SherpaOnnxDecodeOnlineStream(recognizer, stream)
@@ -484,7 +473,6 @@ final class SherpaTranscriber: Transcriber {
                     chunkID: currentChunkID ?? UUID(),
                     index: chunkIndex,
                     text: remainder.isEmpty ? fullText : remainder,
-                    voicedSegments: voicedSegments,
                     startSample: turnStartSample,
                     endSample: cumulativeSamples
                 ))
@@ -496,10 +484,9 @@ final class SherpaTranscriber: Transcriber {
 
     // MARK: — Worker
 
-    /// Splits the turn at VAD silence gaps ≥ `vadSplitGapSamples` and emits
-    /// one row per group. Sentence-boundary capping is handled mid-turn by
-    /// the accumulator (force-completions), so the remainder text arriving
-    /// here is already reasonably short.
+    /// Emits a completed turn as a single row. Speaker-boundary splits and
+    /// sentence-length splits are both handled in the accumulator, so each
+    /// TurnRecord arriving here represents exactly one row.
     private func processTurn(
         turn: TurnRecord,
         source: SourceTag,
@@ -515,96 +502,11 @@ final class SherpaTranscriber: Transcriber {
             onChunkLifecycle?(turn.chunkID, source, .dropped)
             return
         }
-
-        // Group voiced segments: merge when gap < threshold, split when ≥.
-        struct SegGroup {
-            let startSample: Int
-            var endSample: Int
-            var sampleCount: Int
-        }
-        var groups: [SegGroup] = []
-        for (i, seg) in turn.voicedSegments.enumerated() {
-            if !groups.isEmpty {
-                let gap = seg.startSample - turn.voicedSegments[i - 1].endSample
-                if gap >= Self.vadSplitGapSamples {
-                    groups.append(SegGroup(startSample: seg.startSample,
-                                           endSample: seg.endSample,
-                                           sampleCount: seg.sampleCount))
-                    continue
-                }
-            } else {
-                groups.append(SegGroup(startSample: seg.startSample,
-                                       endSample: seg.endSample,
-                                       sampleCount: seg.sampleCount))
-                continue
-            }
-            groups[groups.count - 1].endSample = seg.endSample
-            groups[groups.count - 1].sampleCount += seg.sampleCount
-        }
-        if groups.isEmpty {
-            groups = [SegGroup(startSample: turn.startSample,
-                               endSample: turn.endSample,
-                               sampleCount: 1)]
-        }
-
-        // Fast path: single group.
-        if groups.count == 1 {
-            Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index) → \"\(turn.text.prefix(60))\"")
-            emit(chunkID: turn.chunkID, source: source, text: turn.text,
-                 startSeconds: Double(turn.startSample) / 16_000,
-                 endSeconds:   Double(turn.endSample)   / 16_000,
-                 continuation: continuation)
-            return
-        }
-
-        // Multiple groups: split text proportionally by voiced sample count.
-        let words = turn.text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-        guard !words.isEmpty else {
-            onChunkLifecycle?(turn.chunkID, source, .dropped)
-            return
-        }
-
-        // Don't split if there aren't enough words to give every group a
-        // meaningful share — that's what produces single-word burst rows.
-        guard words.count >= groups.count * Self.minWordsPerVadGroup else {
-            Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index) \(groups.count) VAD groups but only \(words.count) words — emitting as one row")
-            emit(chunkID: turn.chunkID, source: source, text: turn.text,
-                 startSeconds: Double(turn.startSample) / 16_000,
-                 endSeconds:   Double(turn.endSample)   / 16_000,
-                 continuation: continuation)
-            return
-        }
-
-        let totalSamples = groups.reduce(0) { $0 + $1.sampleCount }
-        var wordOffset = 0
-        var cumSamples = 0
-
-        for (gi, group) in groups.enumerated() {
-            cumSamples += group.sampleCount
-            let isLast = gi == groups.count - 1
-
-            let wordEnd: Int
-            if isLast || wordOffset >= words.count {
-                wordEnd = words.count
-            } else {
-                let proportion = Double(cumSamples) / Double(max(totalSamples, 1))
-                let ideal = Int((proportion * Double(words.count)).rounded())
-                let remaining = groups.count - gi - 1
-                wordEnd = max(wordOffset + 1, min(ideal, words.count - remaining))
-            }
-
-            guard wordOffset < words.count else { break }
-            let groupText = words[wordOffset..<wordEnd].joined(separator: " ")
-            wordOffset = wordEnd
-            guard !groupText.isEmpty else { continue }
-
-            let chunkID = gi == 0 ? turn.chunkID : UUID()
-            Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index).\(gi+1) split → \"\(groupText.prefix(60))\"")
-            emit(chunkID: chunkID, source: source, text: groupText,
-                 startSeconds: Double(group.startSample) / 16_000,
-                 endSeconds:   Double(group.endSample)   / 16_000,
-                 continuation: continuation)
-        }
+        Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index) → \"\(turn.text.prefix(60))\"")
+        emit(chunkID: turn.chunkID, source: source, text: turn.text,
+             startSeconds: Double(turn.startSample) / 16_000,
+             endSeconds:   Double(turn.endSample)   / 16_000,
+             continuation: continuation)
     }
 
     private func emit(
