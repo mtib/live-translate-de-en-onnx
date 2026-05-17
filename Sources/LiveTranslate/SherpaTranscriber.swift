@@ -413,8 +413,15 @@ final class SherpaTranscriber: Transcriber {
 
                 Log.line("SherpaTranscriber[\(tag)]: endpoint chunk #\(chunkIndex) remainder=\"\(remainder.prefix(60))\"")
 
-                if remainder.isEmpty && committedLength > 0 {
-                    // Everything was already force-completed mid-turn.
+                // If the ASR revised the final hypothesis to append trailing
+                // punctuation (e.g. "." or "?") after a mid-turn force-complete,
+                // the remainder is purely punctuation — drop it rather than emit
+                // a standalone "." / "?" row.
+                let remainderHasContent = remainder.rangeOfCharacter(from: .alphanumerics) != nil
+                if (remainder.isEmpty || !remainderHasContent) && committedLength > 0 {
+                    if !remainder.isEmpty {
+                        Log.line("SherpaTranscriber[\(tag)]: chunk #\(chunkIndex) punctuation-only tail \"\(remainder)\" → dropped")
+                    }
                     onChunkLifecycle?(currentChunkID ?? UUID(), source, .dropped)
                 } else {
                     sink.yield(TurnRecord(
@@ -462,7 +469,11 @@ final class SherpaTranscriber: Transcriber {
             let remainder = committedLength == 0 ? fullText
                 : String(fullText.dropFirst(min(committedLength, fullText.count)))
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-            if remainder.isEmpty && committedLength > 0 {
+            let flushHasContent = remainder.rangeOfCharacter(from: .alphanumerics) != nil
+            if (remainder.isEmpty || !flushHasContent) && committedLength > 0 {
+                if !remainder.isEmpty {
+                    Log.line("SherpaTranscriber[\(tag)]: flush chunk #\(chunkIndex) punctuation-only tail \"\(remainder)\" → dropped")
+                }
                 onChunkLifecycle?(currentChunkID ?? UUID(), source, .dropped)
             } else {
                 sink.yield(TurnRecord(
@@ -492,6 +503,11 @@ final class SherpaTranscriber: Transcriber {
     ) {
         guard !turn.text.isEmpty else {
             Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index) empty → dropped")
+            onChunkLifecycle?(turn.chunkID, source, .dropped)
+            return
+        }
+        guard turn.text.rangeOfCharacter(from: .alphanumerics) != nil else {
+            Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index) punctuation-only \"\(turn.text)\" → dropped")
             onChunkLifecycle?(turn.chunkID, source, .dropped)
             return
         }
