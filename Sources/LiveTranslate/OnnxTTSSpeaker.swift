@@ -16,9 +16,13 @@ final class OnnxTTSSpeaker: @unchecked Sendable {
 
     // MARK: — Availability
 
-    /// True when the kitten-mini model directory exists in the app bundle.
+    /// True when the kitten-mini model.onnx file exists in the app bundle.
     static func isAvailable() -> Bool {
-        Bundle.main.url(forResource: ModelConfig.ttsModel, withExtension: nil) != nil
+        let path = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Resources")
+            .appendingPathComponent(ModelConfig.ttsModel)
+            .path
+        return FileManager.default.fileExists(atPath: path)
     }
 
     // MARK: — Private state

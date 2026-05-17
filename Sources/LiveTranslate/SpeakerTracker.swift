@@ -33,17 +33,18 @@ final class SpeakerTracker {
 
     /// Returns nil when the model file is missing from the bundle.
     init?() {
-        guard let modelURL = Bundle.main.url(forResource: ModelConfig.speakerModel,
-                                              withExtension: nil) else {
+        let modelPath = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Resources")
+            .appendingPathComponent(ModelConfig.speakerModel)
+            .path
+        guard FileManager.default.fileExists(atPath: modelPath) else {
             Log.line("SpeakerTracker: model not found in bundle (\(ModelConfig.speakerModel))")
             return nil
         }
-
         // Build the config with C-string lifetimes pinned for the duration
         // of the SherpaOnnx call by nesting `withCString` blocks. The
         // result is captured into a local before assigning stored properties.
-        let modelPath = modelURL.path
-        let provider  = ModelConfig.provider
+        let provider = ModelConfig.provider
 
         var cfg = SherpaOnnxSpeakerEmbeddingExtractorConfig()
         cfg.num_threads = 2

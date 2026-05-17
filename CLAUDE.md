@@ -48,24 +48,22 @@ clone of [transcrybe.app](https://transcrybe.app).
 
 ## How it's built
 
-- **No `.xcodeproj`.** Pure SwiftPM plus a CMake-driven build step for
-  whisper.cpp. Built with Command Line Tools (`/Library/Developer/CommandLineTools`)
-  and Homebrew CMake (`brew install cmake`). No Xcode required.
+- **No `.xcodeproj`.** Pure SwiftPM. Built with Command Line Tools
+  (`/Library/Developer/CommandLineTools`). No Xcode required.
 - `swift-tools-version: 6.0`, but the executable target is pinned to
   `.swiftLanguageMode(.v5)` because the Translation APIs are awkward
   under Swift 6 strict concurrency.
-- `./dev-setup.sh` pre-downloads a curated set of GGML models into
-  the repo-local `models/` directory (gitignored). `build.sh` then
-  prefers that cache; falls back to fetching into
-  `build/whisper-models/`.
-- `./build.sh` first runs `tools/build-whisper.sh` (idempotent — clones
-  whisper.cpp v1.7.4 into `external/`, builds static libraries into
-  `build/whisper-prefix/`, ensures the chosen `WHISPER_MODEL` is in
-  `build/whisper-models/`), then `swift build -c release`, then wraps
-  the binary into `build/LiveTranslate.app/`, copies the chosen GGML
-  model into Resources, and codesigns (ad-hoc by default; set
-  `LIVETRANSLATE_SIGN_IDENTITY` to a self-signed cert name to persist
-  TCC grants across rebuilds).
+- `./build.sh` first runs `tools/download-sherpa.sh` (idempotent —
+  downloads sherpa-onnx v1.13.2 osx-arm64 shared dylib into
+  `external/sherpa-onnx/` and all ONNX models into
+  `build/sherpa-models/`), then `swift build -c release`, then wraps
+  the binary into `build/LiveTranslate.app/`, copies the dylibs into
+  `Contents/Frameworks/`, copies models into `Contents/Resources/`,
+  and codesigns (ad-hoc by default; set `LIVETRANSLATE_SIGN_IDENTITY`
+  to a self-signed cert name to persist TCC grants across rebuilds).
+- **Language pair is compile-time.** Default is `de` → `en` (German →
+  English). Change `ModelConfig.sourceLanguage` / `targetLanguage` and
+  swap the ASR model to retarget. No runtime picker.
 - **Always launch via `open build/LiveTranslate.app`** — never run the
   binary directly. TCC associates permission grants with the bundle,
   not the executable path; direct exec leads to the system thinking
@@ -93,22 +91,21 @@ clone of [transcrybe.app](https://transcrybe.app).
                                                   per-source SubtitleArchives
 ```
 
-Both streams share one `WhisperCppTranscriber` (with `NSLock` around
-`whisper_full`). The UI sees in-flight chunks as reserved rows that
-flip through `.listening → .transcribing → .translating`, then
-graduate to a `Sentence` with the **same UUID** — so SwiftUI row
-identity stays stable across the lifecycle.
+Both streams share one `SherpaTranscriber`. The UI sees in-flight
+chunks as reserved rows that flip through `.listening → .transcribing
+→ .translating`, then graduate to a `Sentence` with the **same UUID**
+— so SwiftUI row identity stays stable across the lifecycle.
 
 ### Key design decisions
 
 - **Per-stream pipelines, never mixed.** Mic and system are captured
   in parallel; each goes through its own `RNNoise` (via
   `DenoisingAudioSource`), an `AudioRecorder` writing
-  `<stamp>.<source>.wav`, and a `WhisperCppTranscriber.transcribe(audio:locale:source:)`
+  `<stamp>.<source>.wav`, and a `SherpaTranscriber.transcribe(audio:locale:source:)`
   call. Per-`(source, language)` SRT writers archive sentences as they
-  drop. The transcribers share one whisper context (model + ctx are
-  loaded once under an `NSLock`); `whisper_full` calls serialize via
-  another `NSLock` so the two streams take turns without contention.
+  drop. The transcribers share one sherpa-onnx recognizer (loaded once
+  on first call); each `transcribe()` invocation creates its own stream
+  on the recognizer, so mic and system run in parallel without locks.
 - **Inflight-chunk UI model.** Every chunk reserves a UI row at voice
   onset (state `.listening`). The state then progresses through
   `.transcribing` and (if translation is needed) `.translating` as the
@@ -128,7 +125,7 @@ identity stays stable across the lifecycle.
   the same state machine.
 - **Audio format invariant.** Both sources standardize on **48 kHz
   mono Float32** (RNNoise's native rate). The transcriber downsamples
-  to 16 kHz internally for whisper; each `.wav` writer downcasts to
+  to 16 kHz internally for the recognizer; each `.wav` writer downcasts to
   16-bit Int on the
   write path.
 - **RNNoise per stream.** A vendored copy of xiph/rnnoise v0.1.1
@@ -139,25 +136,20 @@ identity stays stable across the lifecycle.
   ±32768-scaled Float32 in 480-sample frames at 48 kHz — the wrapper
   (`RNNoiseProcessor`) buffers arbitrary input sizes and handles the
   scale conversion. Algorithmic latency: 10 ms.
-- **whisper.cpp is the transcriber.** `WhisperCppTranscriber`
-  downsamples the 48 kHz post-RNNoise stream to 16 kHz, runs an
-  RMS-based VAD to segment into chunks (silence threshold
-  `endChunkAfterSilence` ~0.7 s, hard cap `maxChunkSeconds` 5 s),
-  trims and pads each chunk, then runs `whisper_full()` against the
-  bundled GGML model. Whisper's internal segments are joined into
-  one line per chunk; the chunk's audio-stream sample positions
-  become the sentence's `startSeconds` / `endSeconds`, anchored by
-  Pipeline at `runStartedAt` so JSONL/SRT timestamps map directly to
-  positions in the paired `.wav`.
-- **GGML model: bundled only.** `WhisperCppTranscriber.bundledModelName`
-  is the filename (sans `.bin`) of the model loaded at runtime. The
-  build script copies `models/<MODEL_NAME>` (or downloads it if not
-  cached) into `Contents/Resources/`. Default is `ggml-small-q5_1`
-  (~190 MB) — ~2× faster than the previous large-v3-turbo at
-  acceptable quality for live use. Swap by editing both
-  `bundledModelName` and `WHISPER_MODEL` (env var consumed by
-  `build.sh` + `tools/build-whisper.sh`). No runtime user-override
-  path; what you built is what you run.
+- **sherpa-onnx streaming RNN-T is the transcriber.** `SherpaTranscriber`
+  downsamples the 48 kHz post-RNNoise stream to 16 kHz (AVAudioConverter),
+  feeds samples into both a Silero-VAD instance (for voiced/silence
+  gating) and a sherpa-onnx streaming zipformer recognizer. When the
+  recognizer fires its built-in endpoint (≥1 s trailing silence, rule 1),
+  the committed text is read BEFORE resetting the stream, then a
+  `SpeakerTracker` assigns a `[Speaker N]` label via campplus embedding +
+  cosine-sim clustering. The labeled text is emitted as `.completed`.
+- **ONNX models: bundled only.** All models are copied into
+  `Contents/Resources/` by `build.sh` (downloaded by
+  `tools/download-sherpa.sh`). Language pair is a compile-time
+  constant in `ModelConfig.swift` — change `sourceLanguage`,
+  `targetLanguage`, and the `asrModel*` path constants and rebuild.
+  No runtime override; what you built is what you run.
 - **Auto-gain control.** `DenoisingAudioSource` runs a per-instance
   envelope-follower AGC after RNNoise and before the crosstalk gate:
   measure RMS via `vDSP_measqv`, EMA the input level on voiced
@@ -165,10 +157,10 @@ identity stays stable across the lifecycle.
   avoid pumping), multiply via `vDSP_vsmul`. Caps at 8× boost; never
   attenuates (`agcMinGain=1`). This lets mic and system arrive at
   comparable loudness without manual tuning.
-- **Transcribers emit one sentence per closed chunk.** The
-  transcriber owns chunk boundaries (via RMS) and the joining of
-  whisper's internal segments. Pipeline never edits a `Sentence`
-  in place; ingest just appends.
+- **Transcribers emit one sentence per closed turn.** The transcriber
+  owns turn boundaries (via sherpa-onnx endpoint detection) and speaker
+  labeling. Pipeline never edits a `Sentence` in place; ingest just
+  appends.
 - **Translation is per-chunk, inline.** When `.completed(text)` fires
   in `applyLifecycle`, Pipeline either graduates immediately (src ==
   tgt language, or cache hit) or sets the inflight row to
@@ -181,18 +173,16 @@ identity stays stable across the lifecycle.
   keyed by source text. Identical strings during a run reuse the
   cached translation. LRU-ish eviction at 200 entries.
 - **Live translated-audio HTTP stream (optional, opt-in by capability).**
-  When the run starts, Pipeline checks `TTSSpeaker.bestVoice(forTargetCode:)`.
-  If a voice is installed for the target and src != tgt language, it
-  spins up `LiveAudioServer` on port 8765 and a `TTSSpeaker` that
-  speaks each graduated sentence's translation into the stream. The
+  When the run starts, Pipeline checks `OnnxTTSSpeaker.isAvailable()`.
+  If the kitten-mini model is bundled and src != tgt language, it
+  spins up `LiveAudioServer` on port 8765 and an `OnnxTTSSpeaker` that
+  synthesizes each graduated sentence's translation into the stream. The
   UI shows a small share icon (radio-waves SF Symbol) in the bar
   while this is active; clicking it pops a panel with the URL and a
-  QR code so a phone on the same Wi-Fi can listen. If no voice is
-  installed for that language, the whole feature is skipped silently
-  (icon stays hidden) — we never play wrong-language audio. Wire
-  format: 24 kHz mono PCM16 LE, served as an open-ended WAV
-  (`0xFFFFFFFF` chunk sizes). 200 ms heartbeat broadcasts 50 ms of
-  silence when idle so VLC doesn't tear the socket down.
+  QR code so a phone on the same Wi-Fi can listen. Wire format: 24 kHz
+  mono PCM16 LE, served as an open-ended WAV (`0xFFFFFFFF` chunk sizes).
+  200 ms heartbeat broadcasts 50 ms of silence when idle so VLC doesn't
+  tear the socket down.
 - **Pruning.** Non-protected sentences whose `lastModified` is older
   than 5 minutes get dropped once per second. Hard cap at **50**
   retained — generous so the user can scroll back through history.
@@ -259,32 +249,32 @@ identity stays stable across the lifecycle.
 | `DenoisingAudioSource.swift` | Wraps any `AudioSource`, applies its own `RNNoiseProcessor`, re-broadcasts. One per input stream so denoiser state is independent. |
 | `RNNoiseProcessor.swift` | Swift wrapper around the vendored RNNoise C library. Owns the `DenoiseState`, buffers arbitrary-sized input into 480-sample frames, handles ±32768 ↔ ±1 scaling, emits denoised samples via `drain(into:count:)`. |
 | `CRNNoise/` | Vendored xiph/rnnoise v0.1.1 as a SwiftPM C target. BSD 3-clause; GRU weights statically linked. See `Sources/CRNNoise/README.md`. |
-| `WhisperCppTranscriber.swift` | **The transcriber.** Two structured-concurrency child tasks via `async let` (per `transcribe()` call): an accumulator that pumps audio and emits closed chunks on silence/max-chunk, and a worker that runs `whisper_full()`. Multiple concurrent calls (mic + system) share one `ctx` and serialize via `NSLock` around `whisper_full`. Per-source `previousChunkTail` keyed by `SourceTag` keeps `initial_prompt` context independent per stream. |
-| `CWhisper/` | SwiftPM bridge target around `libwhisper.a` + `libggml*.a` produced by `tools/build-whisper.sh`. Headers (`whisper.h`, `ggml*.h`) are mirrored in by the build script and gitignored. |
+| `SherpaTranscriber.swift` | **The transcriber.** Two structured-concurrency child tasks (accumulator + worker) per `transcribe()` call. Accumulator resamples 48→16 kHz, feeds Silero-VAD + sherpa-onnx streaming recognizer, fires endpoint events. Worker reads committed text, runs speaker embedding, emits `.completed([Speaker N] text)`. |
+| `SpeakerTracker.swift` | campplus speaker embedding extraction + cosine-sim clustering. One instance per audio stream; `label(for:)` synchronously returns "Speaker N". |
+| `ModelConfig.swift` | Compile-time constants: source/target language codes, ONNX model paths relative to `Contents/Resources/`. |
+| `CSherpaOnnx/` | SwiftPM C bridge target: `c-api.h` header + stub `.c` file. Linker flags point at `external/sherpa-onnx/lib/`. |
 | `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
 | `TranscriptArchive.swift` | One-per-run JSONL archive. Rows carry a `source` field (`"mic"` / `"system"`) plus the audio-anchored `start`/`end` timestamps. |
 | `AudioRecorder.swift` | One-per-stream `.wav` writer fed by a parallel consumer of its source's broadcaster. 48 kHz mono Int16. |
 | `SubtitleArchive.swift` | One-per-`(source,language)` SRT writer. Cue times are offsets into the matching `<stamp>.<source>.wav`. |
 | `Paths.swift` | Single source of truth for `~/Documents/LiveTranslate/{transcripts,recordings}/<stamp>.<source>[.<lang>].{wav,srt}` plus the shared `<stamp>.jsonl`. |
 | `Log.swift` | Append-only file logger at `/tmp/livetranslate.log`. Truncates on launch if > 5 MB. |
-| `TTSSpeaker.swift` | Synthesizes finalized translations to 24 kHz PCM16 LE buffers via `AVSpeechSynthesizer.write(_:toBufferCallback:)` (never plays through local speakers). Serial queue — one utterance fully before the next; drops oldest pending past 5. `bestVoice(forTargetCode:)` picks the highest-quality installed voice for the target's primary subtag, or nil. |
+| `OnnxTTSSpeaker.swift` | Synthesizes finalized translations via kitten-mini ONNX TTS to 24 kHz PCM16 LE. Serial queue, drops oldest past 5. `isAvailable()` checks for the model file in the bundle. |
 | `LiveAudioServer.swift` | Hand-rolled HTTP/1.1 server on a `NWListener` that streams 24 kHz mono PCM16 LE WAV to any client. Header advertises `0xFFFFFFFF` data size → "read until close" (works in VLC / mpv / iOS Safari / Chrome). 200 ms heartbeat task pushes 50 ms of silence when idle to keep VLC's socket alive. |
 
 ## Key behaviors / non-obvious bits
 
-### One chunk = one sentence
+### One turn = one sentence
 
-The RMS-based VAD in `WhisperCppTranscriber` already splits the audio
-at natural pauses, so each chunk fed to `whisper_full()` is, by
-construction, one utterance. Whisper's internal segmentation (it can
-emit multiple `whisper_segment`s per call when it detects sub-pauses)
-is joined into a single line before the snapshot leaves the
-transcriber. The Pipeline gets one `SessionSentence` per closed
-chunk, which lands as one `Sentence` row, which writes one JSONL line
-and one SRT cue.
+`SherpaTranscriber`'s accumulator feeds audio into the sherpa-onnx
+streaming recognizer continuously; when the recognizer fires an endpoint
+(≥1 s trailing silence) the committed hypothesis is read, labeled with
+a `[Speaker N]` prefix, and emitted as a single sentence. The Pipeline
+gets one `SessionSentence` per closed turn, which lands as one `Sentence`
+row, which writes one JSONL line and one SRT cue.
 
-This also means: the transcriber owns sentence segmentation. The
-Pipeline never splits, the Pipeline never edits-in-place.
+The transcriber owns sentence segmentation. The Pipeline never splits,
+the Pipeline never edits-in-place.
 
 ### Audio-stream timing (SRT/JSONL ↔ WAV alignment)
 
@@ -303,54 +293,30 @@ SRT cues therefore line up sample-accurately with the `.wav` and the
 JSONL `start`/`end` ISO timestamps are usable as audio offsets.
 
 Backends that don't report timing pass `nil` for `startSeconds` /
-`endSeconds` and Pipeline falls back to `Date()` at ingest — but
-whisper.cpp always reports timing now, and there's no other backend.
+`endSeconds` and Pipeline falls back to `Date()` at ingest.
 
-### Concurrent accumulator + worker (the "second sentence dropped" bug)
+### Concurrent accumulator + worker
 
-Whisper takes 1-3 s to process a chunk. If we ran the audio pump
-synchronously with whisper (close chunk → run whisper → resume pump),
-any utterance during whisper's processing would be lost — the
-upstream broadcaster keeps producing buffers but no one is consuming
-the AsyncStream.
+Speaker embedding takes a few hundred ms. If we ran it synchronously
+in the audio pump, audio would accumulate in the broadcaster unread
+during that time.
 
 The fix is two structured child tasks under one `async let`:
 
-- **Accumulator** reads audio forever, emitting closed chunks into a
-  `AsyncStream<ChunkBuffer>` queue. Never blocked.
-- **Worker** drains the queue, runs whisper serially, yields
-  `SessionSnapshot`s back. Sees chunks in order.
+- **Accumulator** reads audio forever, feeds the streaming recognizer,
+  emits a `TurnRecord` (text + samples) on each endpoint.
+- **Worker** drains the `TurnRecord` queue, computes speaker embedding,
+  fires lifecycle events. Sees turns in order.
 
 The queue is unbounded; backpressure isn't a concern at our rates.
 
-### Whisper hallucinates on silence
+### sherpa-onnx text must be read before Reset()
 
-Trained on captioned video, the model fabricates phrases like "Thanks
-for watching!" or "[Music]" given near-silent input. Four defences:
-
-1. **Skip chunks with no voice** — `firstVoiceSample16k == nil`.
-2. **Trim leading/trailing silence** off the chunk (with 100 ms of
-   padding so word edges aren't clipped).
-3. **Silence-close is gated on total chunk length** — the accumulator
-   only allows a silence-driven close once the *chunk as a whole* is
-   at least `minWhisperInputSeconds` (1.1 s). Without this, a short
-   utterance (e.g. "yes") would silence-close instantly and the worker
-   would have to either pad or drop it; with it, the chunk grows past
-   the threshold and we send a clean utterance through. Max-chunk
-   close still fires regardless (the worker's pad-to-1.1s is the
-   final safety net).
-4. **Pad short trimmed clips with trailing zeros to ≥1.1 s.** Whisper
-   silently returns zero segments for audio under ~1 s — its
-   mel-spectrogram threshold is 100 frames at 10 ms each. Padded
-   silence at the end is fine.
-
-### `initial_prompt` continuity across chunks
-
-The transcriber stashes the last ~120 chars of the previous chunk's
-text as `previousChunkTail` (a dictionary keyed by `SourceTag`) and
-passes it as `params.initial_prompt` on the next chunk. Per-source
-because mic and system content is unrelated — mixing the tails would
-pollute each.
+The streaming recognizer accumulates a committed hypothesis in `stream`.
+After an endpoint, the hypothesis is read with
+`SherpaOnnxGetOnlineStreamResult(recognizer, stream)`, **then** the stream
+is reset with `SherpaOnnxOnlineStreamReset`. Reading after Reset would
+return an empty string. The accumulator does this in the right order.
 
 ### Per-source crosstalk suppression (speaker bleed into mic)
 
@@ -406,8 +372,8 @@ The bundle declares:
 
 Mic prompts via `AVCaptureDevice.requestAccess`. Screen recording
 prompts when `SCStream.startCapture()` runs the first time. No speech
-recognition permission — whisper.cpp runs locally against a bundled
-GGML model and doesn't touch Apple's Speech APIs.
+recognition permission — sherpa-onnx runs locally against bundled ONNX
+models and doesn't touch Apple's Speech APIs.
 
 Reset stale grants with:
 ```sh
@@ -448,7 +414,11 @@ builds reuse the existing grant. See README for the one-time setup.
 
 - [ ] Per-app audio capture (instead of whole-machine) via SCK's filter
 - [x] RNNoise denoising on the merged stream (vendored, BSD 3-clause)
-- [ ] whisper.cpp backend as an alternative `Transcriber` impl (in progress on `whisper-cpp` branch)
+- [x] sherpa-onnx streaming RNN-T (zipformer) replaces whisper.cpp
+- [x] Silero-VAD endpoint detection
+- [x] campplus speaker diarization (`[Speaker N]` labels)
+- [x] kitten-mini ONNX TTS replaces AVSpeechSynthesizer
+- [ ] Speaker name assignment / correction UI
 - [ ] OpenRouter fallback as an alternative `Translator` impl
 - [ ] Global hotkey to start/stop
 - [ ] Click-through floating overlay mode
@@ -607,37 +577,46 @@ pkill -f LiveTranslate                           # kill all instances
     accumulator was never running).
 20. **Crosstalk: mic always picks up some of the system's audio
     through the speakers.** Affects transcription quality (mic
-    transcribes the bleed). Mitigation: `WhisperCppTranscriber`
+    transcribes the bleed). Mitigation: `SherpaTranscriber`
     carries a shared `lastSystemVoicedAt: Date` (NSLock-protected);
     system accumulator stamps it per voiced buffer; mic accumulator
     queries it per buffer; if system was voiced within
     `crosstalkPersistSeconds` (250 ms), the mic's current buffer is
-    replaced with silence in the 16 kHz sample array and voiced-span
-    markers aren't credited. The chunk's timing keeps advancing so
-    WAV alignment stays correct. **Caveat**: this affects only what
-    whisper sees; the mic `.wav` recording still has the raw bleed
-    because it consumes the broadcaster directly, upstream of the
-    muting logic. Acceptable for transcription quality; a future
-    improvement could mute the recorded buffer too.
+    zeroed before being fed to the recognizer. **Caveat**: this affects
+    only what the recognizer sees; the mic `.wav` recording still has
+    the raw bleed because it consumes the broadcaster upstream.
 21. **`SourcePipeline` shouldn't be `@MainActor`.** Pipeline is
     @MainActor, and naively making child classes follow suit would
     serialize the per-stream accumulators on the MainActor — both
     audio paths plus the worker would queue behind UI updates. Keep
-    `SourcePipeline`, `WhisperCppTranscriber`, `DenoisingAudioSource`
+    `SourcePipeline`, `SherpaTranscriber`, `DenoisingAudioSource`
     as plain classes; their methods run on whatever executor the
     Swift runtime chose (cooperative pool from `withTaskGroup`).
     Only the UI-state writes hop back to MainActor (via
-    `Task { @MainActor in ... }` or via `Pipeline.consumeSentences`
-    which is itself @MainActor).
-22. **`tools/build-whisper.sh` skipped header mirroring when the prefix
-    was already on disk.** Symptom after switching from a feature
-    branch that didn't carry `Sources/CWhisper/` back to `main`:
-    `swift build` fails with `'whisper.h' file not found` despite
-    `build/whisper-prefix/lib/libwhisper.a` being right there. Cause:
-    the script's idempotency guard (`SKIP_LIB_BUILD=1`) wrapped the
-    `cp …/include/*.h Sources/CWhisper/include/` step as well as the
-    cmake build, so a branch-switch that wiped the bridge target's
-    include dir wasn't re-populated on the next build. Fix: the
-    header mirror runs unconditionally now — it's a fast `cp` and
-    keeps the bridge in sync with whatever prefix is currently
-    installed.
+    `Task { @MainActor in ... }`).
+22. **(Retired — was specific to whisper.cpp header mirroring.)**
+23. **sherpa-onnx CoreML EP is only in the shared dylib build.**
+    The `xcframework` release does NOT include CoreML. You must use
+    `osx-arm64-shared.tar.bz2` and bundle the dylibs in `Frameworks/`.
+    Without this, `provider = "coreml"` silently falls back to CPU.
+24. **`SherpaOnnxOfflineTtsGenerate` is deprecated.** Always use
+    `SherpaOnnxOfflineTtsGenerateWithConfig` with a `SherpaOnnxGenerationConfig`
+    struct. The old function still compiles but triggers a deprecation
+    warning; the new one also supports callback-based progress and
+    reference-audio voice cloning.
+25. **kitten-mini TTS has no `lexicon.txt`.** Its model directory
+    contains `model.onnx`, `voices.bin`, `tokens.txt`, and
+    `espeak-ng-data/`. The `SherpaOnnxOfflineTtsKittenModelConfig`
+    struct has fields `model`, `voices`, `tokens`, `data_dir` —
+    no `lexicon` field exists. Don't add one; it'll crash.
+26. **`Bundle.main.url(forResource:withExtension:)` doesn't handle
+    subdirectory paths.** `ModelConfig.ttsModel` is
+    `"kitten-mini-en-v0_8/model.onnx"` — the slash means Bundle API
+    returns nil. Always construct paths via
+    `Bundle.main.bundleURL.appendingPathComponent("Contents/Resources").appendingPathComponent(relative)`.
+    The `resourcePath(_:)` helper in `SherpaTranscriber` /
+    `OnnxTTSSpeaker` does this correctly.
+27. **sherpa-onnx GitHub release tag for speaker models has a typo.**
+    The tag is `speaker-recongition-models` (missing the 'i' in
+    recognition). `tools/download-sherpa.sh` uses the exact typo-d URL;
+    do not "fix" it.

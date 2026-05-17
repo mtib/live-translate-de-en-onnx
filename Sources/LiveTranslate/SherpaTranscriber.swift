@@ -408,11 +408,12 @@ final class SherpaTranscriber: Transcriber {
     /// Build a Silero-VAD instance from the bundled model. Returns nil when
     /// the model file is absent (we fall back to RMS-based detection).
     private func makeVAD() -> OpaquePointer? {
-        guard let vadURL = Bundle.main.url(forResource: ModelConfig.vadModel,
-                                            withExtension: nil) else {
+        let vadPath = resourcePath(ModelConfig.vadModel)
+        guard FileManager.default.fileExists(atPath: vadPath) else {
             Log.line("SherpaTranscriber: VAD model not in bundle, using RMS fallback")
             return nil
         }
+        let vadURL = URL(fileURLWithPath: vadPath)
         var silero = SherpaOnnxSileroVadModelConfig()
         memset_zero(&silero)
         silero.threshold            = 0.5
