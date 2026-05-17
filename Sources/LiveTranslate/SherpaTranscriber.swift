@@ -38,9 +38,15 @@ final class SherpaTranscriber: Transcriber {
     static let crosstalkPersistSeconds: TimeInterval = 0.25
 
     /// Silence gap between two voiced segments that triggers a row split.
-    /// 0.5 s is long enough to catch most speaker-turn boundaries while
-    /// leaving typical within-sentence clause pauses intact.
-    private static let vadSplitGapSamples: Int = Int(0.5 * 16_000)
+    /// 0.8 s sits just under the 1.0 s ASR endpoint threshold so only
+    /// genuine between-utterance pauses split rows; shorter breath/clause
+    /// pauses are left intact.
+    private static let vadSplitGapSamples: Int = Int(0.8 * 16_000)
+
+    /// Minimum words each split group must receive. If the available words
+    /// can't satisfy this for every group, the split is skipped and the
+    /// whole text is emitted as one row to avoid single-word burst rows.
+    private static let minWordsPerVadGroup = 4
 
     /// Once the active partial exceeds this many characters the accumulator
     /// looks for a sentence-ending punctuation boundary (`. `, `? `, `! `)
@@ -555,6 +561,17 @@ final class SherpaTranscriber: Transcriber {
         let words = turn.text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
         guard !words.isEmpty else {
             onChunkLifecycle?(turn.chunkID, source, .dropped)
+            return
+        }
+
+        // Don't split if there aren't enough words to give every group a
+        // meaningful share — that's what produces single-word burst rows.
+        guard words.count >= groups.count * Self.minWordsPerVadGroup else {
+            Log.line("SherpaTranscriber[\(source.rawValue)]: chunk #\(turn.index) \(groups.count) VAD groups but only \(words.count) words — emitting as one row")
+            emit(chunkID: turn.chunkID, source: source, text: turn.text,
+                 startSeconds: Double(turn.startSample) / 16_000,
+                 endSeconds:   Double(turn.endSample)   / 16_000,
+                 continuation: continuation)
             return
         }
 
