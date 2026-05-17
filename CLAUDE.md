@@ -141,9 +141,18 @@ chunks as reserved rows that flip through `.listening → .transcribing
   feeds samples into both a Silero-VAD instance (for voiced/silence
   gating) and a sherpa-onnx streaming zipformer recognizer. When the
   recognizer fires its built-in endpoint (≥1 s trailing silence, rule 1),
-  the committed text is read BEFORE resetting the stream, then a
-  `SpeakerTracker` assigns a `[Speaker N]` label via campplus embedding +
-  cosine-sim clustering. The labeled text is emitted as `.completed`.
+  the committed text is read BEFORE resetting the stream.
+- **Per-segment speaker detection splits turns.** Within each endpoint-bounded
+  turn, the accumulator tracks individual voiced segments (each
+  contiguous run of voiced audio separated by VAD silence). The worker
+  runs campplus embedding on each segment (skipping segments < 0.1 s),
+  then groups consecutive same-speaker segments. If only one speaker
+  group, the turn emits as a single `.completed` chunk. If multiple
+  speakers, the text is split proportionally by voiced audio duration and
+  emitted as separate chunks — one per speaker group. **Speaker labels
+  are NOT shown in the UI**; the visual separation (separate rows) is
+  the cue. Additional groups beyond the first use a fresh UUID and
+  emit `.completed` directly (no prior `.listening` row).
 - **ONNX models: bundled only.** All models are copied into
   `Contents/Resources/` by `build.sh` (downloaded by
   `tools/download-sherpa.sh`). Language pair is a compile-time
