@@ -89,7 +89,7 @@ struct TranscriptView: View {
     private var compactBar: some View {
         HStack(spacing: 6) {
             primaryButton(compact: true)
-            Text("\(pipeline.source.identifier) → \(pipeline.target.code)")
+            Text("\(pipeline.source.identifier.prefix(2)) → \(pipeline.target.code)")
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
             Spacer(minLength: 4)
@@ -100,18 +100,21 @@ struct TranscriptView: View {
         }
     }
 
-    /// Full bar: primary action, source/target pickers, compact toggle.
-    /// In-flight chunk state is visible in the sentence list rows;
-    /// the Start/Stop button color is the only "is the pipeline
-    /// running?" cue.
+    /// Full bar: primary action, language pair label, compact toggle.
+    /// Language pair is a compile-time constant (ModelConfig.sourceLanguage →
+    /// ModelConfig.targetLanguage) — no runtime picker.
     private var fullBar: some View {
         HStack(spacing: 10) {
             primaryButton(compact: false)
-            sourcePicker
-            Image(systemName: "arrow.right")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            targetPicker
+            Text("\(ModelConfig.sourceLanguage) → \(ModelConfig.targetLanguage)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(.secondary.opacity(0.1))
+                )
             Spacer(minLength: 6)
             streamShareButton
             iconButton("chevron.up", help: "Compact view") {
@@ -198,31 +201,6 @@ struct TranscriptView: View {
         .tint(finalizing ? .secondary : (pipeline.isRunning ? .red : .accentColor))
         .disabled(finalizing)
         .keyboardShortcut(.return, modifiers: [])
-    }
-
-    private var sourcePicker: some View {
-        Picker("", selection: $pipeline.source) {
-            ForEach(pipeline.availableSources) { src in
-                Text(src.displayName).tag(src)
-            }
-        }
-        .labelsHidden()
-        .frame(maxWidth: 170)
-        .controlSize(.small)
-        // Enabled even while running: the Pipeline will tear the
-        // current run down (flushing transcripts/audio) and start a
-        // fresh one with the new language.
-    }
-
-    private var targetPicker: some View {
-        Picker("", selection: $pipeline.target) {
-            ForEach(pipeline.availableTargets) { lang in
-                Text(lang.name).tag(lang)
-            }
-        }
-        .labelsHidden()
-        .frame(maxWidth: 140)
-        .controlSize(.small)
     }
 
     private func iconButton(_ systemName: String, help: String, action: @escaping () -> Void) -> some View {

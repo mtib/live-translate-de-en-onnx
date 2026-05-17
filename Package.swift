@@ -23,47 +23,31 @@ let package = Package(
                 ]),
             ]
         ),
-        // Thin bridge target around the externally-built whisper.cpp
-        // static libraries. The libraries themselves live under
-        // build/whisper-prefix/ and are produced by tools/build-whisper.sh
-        // before `swift build`. SwiftPM doesn't ship a way to declare an
-        // external CMake dependency, so we use header search + linker
-        // unsafe-flags pointing at the locally-built prefix.
+        // Thin bridge target around the sherpa-onnx shared dylib.
+        // The dylib lives under external/sherpa-onnx/lib/ and is
+        // downloaded by tools/download-sherpa.sh. build.sh copies it
+        // into the app bundle's Frameworks/ directory and sets RPATH.
         .target(
-            name: "CWhisper",
-            path: "Sources/CWhisper",
+            name: "CSherpaOnnx",
+            path: "Sources/CSherpaOnnx",
             publicHeadersPath: "include",
             cSettings: [
-                // whisper.h is copied in by tools/build-whisper.sh — it
-                // lives next to the bridge header at module-build time.
                 .headerSearchPath("include"),
             ],
             linkerSettings: [
                 .unsafeFlags([
-                    "-L./build/whisper-prefix/lib",
-                    "-lwhisper",
-                    "-lggml",
-                    "-lggml-base",
-                    "-lggml-cpu",
-                    "-lggml-blas",
-                    "-lggml-metal",
-                    // whisper.cpp + ggml are C++ — pull in libc++ for
-                    // the C++ runtime symbols (__cxa_throw,
-                    // __gxx_personality_v0, etc.).
-                    "-lc++",
+                    "-L./external/sherpa-onnx/lib",
+                    "-lsherpa-onnx-c-api",
+                    // onnxruntime is loaded by the sherpa dylib at runtime
+                    // from Frameworks/; we only need to link against it so
+                    // the dynamic loader can locate it.
+                    "-lonnxruntime",
                 ]),
-                // Metal + MetalKit are needed because the ggml-metal
-                // backend is statically linked in and references Apple's
-                // Metal API surface.
-                .linkedFramework("Metal"),
-                .linkedFramework("MetalKit"),
-                .linkedFramework("Foundation"),
-                .linkedFramework("Accelerate"),
             ]
         ),
         .executableTarget(
             name: "LiveTranslate",
-            dependencies: ["CRNNoise", "CWhisper"],
+            dependencies: ["CRNNoise", "CSherpaOnnx"],
             path: "Sources/LiveTranslate",
             swiftSettings: [
                 // Swift 5 mode keeps the data-flow code (AsyncStream pumping

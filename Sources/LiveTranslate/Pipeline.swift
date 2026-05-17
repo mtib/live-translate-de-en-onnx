@@ -28,8 +28,7 @@ private let liveStreamPort: UInt16 = 8765
 //                                                   source-tagged) + per-source
 //                                                   SubtitleArchives
 //
-// Both streams share one `WhisperCppTranscriber` (and its `whisper_full`
-// invocations serialize via NSLock). The UI sees in-flight chunks as
+// Both streams share one `SherpaTranscriber`. The UI sees in-flight chunks as
 // reserved rows that flip through .listening → .transcribing →
 // .translating and graduate to a `Sentence` with the same UUID — so the
 // SwiftUI row identity stays stable across the lifecycle.
@@ -61,61 +60,22 @@ final class Pipeline: ObservableObject {
     /// QR code so a phone-with-headphones can listen along.
     @Published private(set) var liveStreamURL: String?
 
-    // MARK: - User settings (persisted)
+    // MARK: - Language (compile-time constant)
 
-    /// Changing source/target while a run is in progress flushes the
-    /// current run to disk and immediately starts a fresh one — new
-    /// recording, new SRTs, new JSONL, clean visible history. The
-    /// new run picks up the new language values when it opens its
-    /// output files and starts its recognizer.
-    @Published var source: SourceLocale {
-        didSet {
-            persist(source, forKey: K.source)
-            if oldValue != source { requestRestartIfRunning() }
-        }
-    }
-    @Published var target: TargetLanguage {
-        didSet {
-            persist(target, forKey: K.target)
-            if oldValue != target { requestRestartIfRunning() }
-        }
-    }
+    /// Source language — compile-time constant from ModelConfig.
+    /// Exposed as a property (not a published var) so existing code that reads
+    /// `pipeline.source` and `pipeline.target` (e.g. TranscriptView's
+    /// translationConfig) continues to work without changes.
+    let source: SourceLocale = SourceLocale(identifier: "\(ModelConfig.sourceLanguage)-\(ModelConfig.sourceLanguage.uppercased())")
 
-    /// Non-protected sentence older than this is pruned. Tuned for
-    /// "rows can scroll off the top before they disappear" — five
-    /// minutes is enough for several screen-heights of history at
-    /// normal conversational pace.
+    /// Target language — compile-time constant from ModelConfig.
+    let target: TargetLanguage = TargetLanguage(code: ModelConfig.targetLanguage, name: ModelConfig.targetLanguage)
+
+    /// Non-protected sentence older than this is pruned.
     var maxAgeSeconds: TimeInterval = 300
 
-    /// Hard cap on retained sentences. Generous so the scrollback
-    /// stays useful; pruning by age handles long sessions.
+    /// Hard cap on retained sentences.
     var maxSentenceCount: Int = 50
-
-    // MARK: - Available choices
-
-    /// Curated BCP-47 locales available in the source-language picker.
-    /// whisper.cpp accepts the 2-letter prefix of any of these (e.g.
-    /// "de-DE" → "de"), so the region tag is purely for the macOS
-    /// `Locale.localizedString(forIdentifier:)` to produce a nice
-    /// display name like "German (Germany)". Reordered roughly by
-    /// expected user popularity.
-    let availableSources: [SourceLocale] = [
-        "en-US", "en-GB", "de-DE", "fr-FR", "es-ES", "it-IT",
-        "pt-PT", "pt-BR", "nl-NL", "da-DK", "sv-SE", "no-NO",
-        "fi-FI", "pl-PL", "cs-CZ", "uk-UA", "ru-RU", "tr-TR",
-        "el-GR", "he-IL", "ar-SA", "hi-IN", "th-TH", "vi-VN",
-        "ja-JP", "ko-KR", "zh-CN", "zh-TW",
-    ].map { SourceLocale(identifier: $0) }
-    let availableTargets: [TargetLanguage] = [
-        .init(code: "en", name: "English"), .init(code: "de", name: "German"),
-        .init(code: "fr", name: "French"), .init(code: "es", name: "Spanish"),
-        .init(code: "it", name: "Italian"), .init(code: "pt", name: "Portuguese"),
-        .init(code: "nl", name: "Dutch"), .init(code: "da", name: "Danish"),
-        .init(code: "sv", name: "Swedish"), .init(code: "ja", name: "Japanese"),
-        .init(code: "zh-Hans", name: "Chinese (Simplified)"),
-        .init(code: "ko", name: "Korean"), .init(code: "ru", name: "Russian"),
-        .init(code: "ar", name: "Arabic"), .init(code: "hi", name: "Hindi"),
-    ]
 
     // MARK: - Stages
 
@@ -149,11 +109,10 @@ final class Pipeline: ObservableObject {
     /// it after `defer` clears the rest of the state.
     private var currentOutputs: Paths.Outputs?
     /// Speaks finalized translations as 24 kHz PCM16 buffers and pushes
-    /// them into `liveAudioServer`. Created at run start only if a
-    /// voice for the target language is installed. Nil otherwise —
-    /// the whole stream feature is skipped (icon stays hidden) so we
-    /// never broadcast wrong-language audio.
-    private var ttsSpeaker: TTSSpeaker?
+    /// them into `liveAudioServer`. Created at run start only if the
+    /// kitten-mini ONNX TTS model is bundled. Nil otherwise —
+    /// the whole stream feature is skipped (icon stays hidden).
+    private var ttsSpeaker: OnnxTTSSpeaker?
     private var liveAudioServer: LiveAudioServer?
 
     /// Set by a settings-change observer; read by run()'s defer. When
@@ -164,25 +123,6 @@ final class Pipeline: ObservableObject {
     /// compute SRT cue offsets (`sentence.createdAt - runStartedAt`).
     private var runStartedAt: Date = .distantPast
 
-    // MARK: - Persistence
-
-    private let defaults = UserDefaults.standard
-    private enum K {
-        static let source = "pipeline.source"
-        static let target = "pipeline.target"
-    }
-
-    private func persist<T: Encodable>(_ value: T, forKey key: String) {
-        guard let data = try? JSONEncoder().encode(value) else { return }
-        defaults.set(data, forKey: key)
-    }
-    private static func load<T: Decodable>(_ type: T.Type, forKey key: String, defaultValue: T) -> T {
-        guard let data = UserDefaults.standard.data(forKey: key),
-              let v = try? JSONDecoder().decode(T.self, from: data)
-        else { return defaultValue }
-        return v
-    }
-
     init(
         micSource: AudioSource? = nil,
         systemSource: AudioSource? = nil,
@@ -191,22 +131,17 @@ final class Pipeline: ObservableObject {
     ) {
         self.micSource = micSource ?? MicrophoneSource()
         self.systemSource = systemSource ?? SystemAudioSource()
-        let whisperTranscriber = transcriber ?? WhisperCppTranscriber()
-        self.transcriber = whisperTranscriber
+        let sherpaTranscriber = transcriber ?? SherpaTranscriber()
+        self.transcriber = sherpaTranscriber
         self.translator = translator ?? AppleTranslator()
-
-        self.source = Self.load(SourceLocale.self, forKey: K.source,
-                                defaultValue: SourceLocale(identifier: "de-DE"))
-        self.target = Self.load(TargetLanguage.self, forKey: K.target,
-                                defaultValue: TargetLanguage(code: "en", name: "English"))
 
         // Wire the transcriber's per-chunk lifecycle callback. The
         // accumulator + worker invoke it from background tasks;
         // `handleChunkLifecycle` hops to MainActor and runs the state
         // machine (inflight bookkeeping + graduation to Sentence +
         // translation dispatch).
-        if let w = whisperTranscriber as? WhisperCppTranscriber {
-            w.onChunkLifecycle = { [weak self] id, source, event in
+        if let s = sherpaTranscriber as? SherpaTranscriber {
+            s.onChunkLifecycle = { [weak self] id, source, event in
                 self?.handleChunkLifecycle(id: id, source: source, event: event)
             }
         }
@@ -214,12 +149,12 @@ final class Pipeline: ObservableObject {
 
     // MARK: - Chunk lifecycle handler
 
-    /// Receives lifecycle events from `WhisperCppTranscriber` (called
+    /// Receives lifecycle events from `SherpaTranscriber` (called
     /// from off-MainActor tasks). All state mutation happens inside
     /// the `Task { @MainActor in ... }` so SwiftUI sees a single
     /// coherent change per event.
     nonisolated private func handleChunkLifecycle(
-        id: UUID, source: SourceTag, event: WhisperCppTranscriber.ChunkLifecycle
+        id: UUID, source: SourceTag, event: SherpaTranscriber.ChunkLifecycle
     ) {
         Task { @MainActor in
             self.applyLifecycle(id: id, source: source, event: event)
@@ -230,7 +165,7 @@ final class Pipeline: ObservableObject {
     /// Maintains `inflightChunks` and graduates completed chunks
     /// (plus their translation, if any) to `sentences`.
     private func applyLifecycle(
-        id: UUID, source: SourceTag, event: WhisperCppTranscriber.ChunkLifecycle
+        id: UUID, source: SourceTag, event: SherpaTranscriber.ChunkLifecycle
     ) {
         switch event {
         case .listening:
@@ -366,16 +301,6 @@ final class Pipeline: ObservableObject {
         stopActiveSources()
     }
 
-    /// Called from the source/target property observers. Stops the
-    /// audio sources so the current run drains naturally, then run()'s
-    /// defer spawns a fresh replacement.
-    private func requestRestartIfRunning() {
-        guard runTask != nil else { return }
-        Log.line("Pipeline.requestRestart() — settings changed mid-run")
-        restartRequested = true
-        stopActiveSources()
-    }
-
     /// Graceful shutdown: stopping each source pipeline ends its
     /// audio broadcaster, which drains the per-stream accumulator +
     /// worker + recording loops. Without this, cancellation would
@@ -477,11 +402,11 @@ final class Pipeline: ObservableObject {
         //    see the same muted audio — without this, `.mic.wav` still
         //    had the raw speaker bleed even though the transcript
         //    suppressed it.
-        let whisper = self.transcriber as? WhisperCppTranscriber
+        let sherpa = self.transcriber as? SherpaTranscriber
         let micDenoised = DenoisingAudioSource(
             micSource,
             label: "mic",
-            muteWhen: { [weak whisper] in whisper?.isSystemRecentlyVoiced() ?? false }
+            muteWhen: { [weak sherpa] in sherpa?.isSystemRecentlyVoiced() ?? false }
         )
         let systemDenoised = DenoisingAudioSource(systemSource, label: "system")
         let denoised: [SourceTag: AudioSource] = [.mic: micDenoised, .system: systemDenoised]
@@ -536,17 +461,14 @@ final class Pipeline: ObservableObject {
 
         // 4c. Spin up the live translated-audio stream IF
         //     (a) src != tgt language (otherwise it's just an echo),
-        //     (b) a TTS voice for the target is actually installed.
-        //     If either fails, we leave `ttsSpeaker` and
-        //     `liveAudioServer` nil and the UI's stream icon stays
-        //     hidden. README nudges the user to install a Premium
-        //     voice for the languages they actually translate to.
-        if srcLangCode != tgtLangCode,
-           let voice = TTSSpeaker.bestVoice(forTargetCode: tgtLangCode) {
+        //     (b) the kitten-mini ONNX TTS model is bundled.
+        //     If either fails, leave `ttsSpeaker` / `liveAudioServer` nil
+        //     so the UI stream icon stays hidden.
+        if srcLangCode != tgtLangCode, OnnxTTSSpeaker.isAvailable() {
             let server = LiveAudioServer(port: liveStreamPort)
             do {
                 try server.start()
-                let speaker = TTSSpeaker(voice: voice, onPCM: { [weak server] pcm in
+                let speaker = OnnxTTSSpeaker(onPCM: { [weak server] pcm in
                     server?.append(pcm)
                 }, onActivityChanged: { [weak server] active in
                     server?.setSpeaking(active)
@@ -554,14 +476,14 @@ final class Pipeline: ObservableObject {
                 self.liveAudioServer = server
                 self.ttsSpeaker = speaker
                 self.liveStreamURL = LiveAudioServer.streamURL(port: liveStreamPort)
-                Log.line("Live audio stream: \(self.liveStreamURL ?? "?") (voice \(voice.name))")
+                Log.line("Live audio stream: \(self.liveStreamURL ?? "?") (kitten-mini ONNX TTS)")
             } catch {
                 Log.line("LiveAudioServer.start failed: \(error.localizedDescription) — TTS stream disabled this run")
             }
         } else if srcLangCode == tgtLangCode {
             Log.line("Live audio stream: skipped (src == tgt)")
         } else {
-            Log.line("Live audio stream: no TTS voice installed for '\(tgtLangCode)' — feature disabled this run")
+            Log.line("Live audio stream: kitten-mini model not bundled — TTS stream disabled this run")
         }
 
         status = .running
@@ -574,7 +496,7 @@ final class Pipeline: ObservableObject {
         }
 
         // 6. Run each SourcePipeline. They emit chunk lifecycle events
-        //    via the WhisperCppTranscriber callback; UI state is
+        //    via the SherpaTranscriber callback; UI state is
         //    managed in `applyLifecycle` (graduation, translation).
         Log.line("Pipeline: entering audio-path TaskGroup with \(sourcePipelines.count) pipelines")
         await withTaskGroup(of: Void.self) { group in
