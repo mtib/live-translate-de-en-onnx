@@ -114,6 +114,7 @@ final class Pipeline: ObservableObject {
     private var partialTranslationTimers: [UUID: Date] = [:]
 
     private var summaryLoopTask: Task<Void, Never>? = nil
+    private var summaryIsRunning = false
     private var lastSummary: TranscriptSummary? = nil
     private var lastSummaryAt: Date? = nil
 
@@ -707,6 +708,7 @@ final class Pipeline: ObservableObject {
             while !Task.isCancelled {
                 let shouldRun = await MainActor.run { [weak self] () -> Bool in
                     guard let self else { return false }
+                    guard !self.summaryIsRunning else { return false }
                     let boundary = self.lastSummaryAt ?? Date()
                     let newCount = self.sentences.filter { $0.createdAt >= boundary }.count
                     let secondsSince = -boundary.timeIntervalSinceNow
@@ -714,7 +716,9 @@ final class Pipeline: ObservableObject {
                 }
 
                 if shouldRun {
+                    await MainActor.run { [weak self] in self?.summaryIsRunning = true }
                     await self?.runOneSummaryCycle(summarizer: summarizer)
+                    await MainActor.run { [weak self] in self?.summaryIsRunning = false }
                     continue  // check again immediately before sleeping
                 }
 
@@ -727,6 +731,7 @@ final class Pipeline: ObservableObject {
     private func stopSummaryLoop() {
         summaryLoopTask?.cancel()
         summaryLoopTask = nil
+        summaryIsRunning = false
         lastSummary = nil
         lastSummaryAt = nil
         transcriptSummary = nil
