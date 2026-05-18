@@ -72,19 +72,23 @@ struct TranscriptView: View {
         if compactMode {
             VStack(alignment: .leading, spacing: 6) {
                 compactBar
+                summaryBar
                 sentenceList(compact: true)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+            .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary != nil)
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 fullBar
                 if case .stopped(let reason) = pipeline.status {
                     errorBanner(reason)
                 }
+                summaryBar
                 sentenceList(compact: false)
             }
             .padding(14)
+            .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary != nil)
         }
     }
 
@@ -158,6 +162,33 @@ struct TranscriptView: View {
                     .padding(16)
                     .frame(width: 240)
             }
+        }
+    }
+
+    /// Summary bar: shows the LLM-generated topic label and 2-sentence
+    /// summary produced by Pipeline every 60 seconds. Hidden when
+    /// `transcriptSummary` is nil (i.e. before the first summary arrives).
+    @ViewBuilder
+    private var summaryBar: some View {
+        if let s = pipeline.transcriptSummary {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(s.topic)
+                    .font(.caption.bold())
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(s.summary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.ultraThinMaterial.opacity(0.5))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .padding(.horizontal, 8)
+            .transition(.opacity.combined(with: .move(edge: .top)))
         }
     }
 
