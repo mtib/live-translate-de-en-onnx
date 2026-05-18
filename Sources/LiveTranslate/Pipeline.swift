@@ -515,6 +515,21 @@ final class Pipeline: ObservableObject {
             offsetURL: outputs.screenSegmentOffset(index),
             runStartedAt: runStartedAt
         )
+        // Wire auto-resume: when macOS stops the SCK stream unexpectedly,
+        // finalize the current segment and open a fresh one so screen
+        // recording continues without user intervention (mirrors the
+        // SystemAudioSource reconnect pattern).
+        recorder.onSystemStop = { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.isActive,
+                      let filter = self.screenFilter,
+                      let outputs = self.currentOutputs else { return }
+                Log.line("Pipeline: screen recorder system-stopped; opening new segment")
+                self.screenRecorder = nil
+                self.isScreenRecording = false
+                await self.openScreenSegment(filter: filter, outputs: outputs)
+            }
+        }
         do {
             try await recorder.start()
             self.screenRecorder = recorder

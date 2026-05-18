@@ -911,3 +911,17 @@ tccutil reset ScreenCapture local.mtib.livetranslate
     attempts — downstream for-await loops remain alive and resume receiving audio as
     soon as capture restarts. `broadcaster.finishAll()` is called only if all five
     attempts exhaust.
+
+39. **`ScreenVideoRecorder` did not auto-resume when macOS stopped its SCK stream.**
+    When the same macOS 26 SCK lifecycle event (lesson #38) also terminated the
+    `ScreenVideoRecorder`'s stream, `didStopWithError` only finalized the current
+    `.mov` segment — no new segment was opened. Symptom: screen recording stopped
+    mid-session whenever the system reset the stream, with no indication in the UI.
+    Fix: added `intentionalStop` flag (same pattern as `SystemAudioSource`) and an
+    `onSystemStop: (() -> Void)?` callback to `ScreenVideoRecorder`. `didStopWithError`
+    checks `intentionalStop` and, on a system stop, calls the callback after
+    `finalizeWriter()`. `Pipeline.openScreenSegment` wires the callback to nil out
+    `screenRecorder`/`isScreenRecording` and call `openScreenSegment` again, producing
+    a new segment that picks up immediately after the gap. The `intentionalStop` guard
+    prevents a reconnect loop when the user calls `stop()` (which also triggers
+    `stopCapture()` and may fire `didStopWithError`).

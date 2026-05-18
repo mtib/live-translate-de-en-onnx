@@ -50,6 +50,15 @@ final class ScreenVideoRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @un
     private var stream: SCStream?
     private let sampleQueue = DispatchQueue(label: "ScreenVideoRecorder.samples", qos: .userInteractive)
 
+    /// Set to `true` in `stop()` before calling `stopCapture()` so that
+    /// `didStopWithError` knows not to attempt a reconnect on a user-initiated stop.
+    private var intentionalStop = false
+
+    /// Called after the writer is finalized when the SCK stream stops
+    /// system-initiated (i.e. NOT via `stop()`). Pipeline wires this to
+    /// open a new segment so screen recording auto-resumes.
+    var onSystemStop: (() -> Void)?
+
     private var writer: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
@@ -137,10 +146,14 @@ final class ScreenVideoRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @un
     /// on the audio timeline). Idempotent; safe to call from `defer`.
     func stop() async {
         guard let stream else { return }
+        // Mark as intentional BEFORE nilling stream and calling stopCapture
+        // so that didStopWithError (if it fires) knows not to reconnect.
+        intentionalStop = true
         self.stream = nil
         do { try await stream.stopCapture() }
         catch { Log.line("ScreenVideoRecorder: stopCapture error: \(error)") }
         await finalizeWriter()
+        intentionalStop = false
     }
 
     // MARK: - Writer setup
@@ -239,13 +252,22 @@ final class ScreenVideoRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @un
 
     // MARK: - SCStreamDelegate
 
-    /// Mid-session window-closed / target-disappeared. Finalize whatever
-    /// we've written so the partial `.mov` is valid up to the last frame;
-    /// `MKVExporter` will play it through its natural duration and the
-    /// audio continues uninterrupted beyond.
+    /// Mid-session stop — either the window/target disappeared, or macOS
+    /// terminated the stream (e.g. during a Space transition on macOS 26).
+    /// Finalize whatever we've written so the partial `.mov` is valid up to
+    /// the last frame, then fire `onSystemStop` if this wasn't user-initiated
+    /// so Pipeline can open a new segment and resume recording.
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         Log.line("ScreenVideoRecorder: stream stopped: \(error.localizedDescription)")
-        Task { await finalizeWriter() }
+        // Guard against user-initiated stops: `stop()` sets `intentionalStop = true`
+        // before calling `stopCapture()`, which is what fires this delegate.
+        guard !intentionalStop else { return }
+        self.stream = nil
+        let callback = onSystemStop
+        Task {
+            await finalizeWriter()
+            callback?()
+        }
     }
 
     // MARK: - Finalize
