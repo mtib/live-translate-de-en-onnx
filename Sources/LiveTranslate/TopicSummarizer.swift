@@ -40,7 +40,8 @@ actor TopicSummarizer {
     ///   - previous: The result from the previous cycle, included in the prompt
     ///     so the model can return a stable topic when the subject hasn't changed.
     func summarize(
-        translations: [String],
+        contextLines: [String],
+        newLines: [String],
         previous: TranscriptSummary?
     ) async throws -> TranscriptSummary {
         guard case .available = SystemLanguageModel.default.availability else {
@@ -53,7 +54,7 @@ actor TopicSummarizer {
             throw TopicSummarizerError.modelUnavailable(reason)
         }
 
-        let prompt = buildPrompt(translations: translations, previous: previous)
+        let prompt = buildPrompt(contextLines: contextLines, newLines: newLines, previous: previous)
 
         let session = LanguageModelSession(
             instructions: """
@@ -64,9 +65,13 @@ actor TopicSummarizer {
             who is present, how many speakers there are, or any other meta \
             information about the conversation itself; the listener already knows \
             all of that. \
-            If the topic or summary has not changed since the previous cycle, \
-            return them exactly as they were. Only update when the content has \
-            meaningfully changed. \
+            The transcript is split into two sections: older lines provided as \
+            background context, and new lines that arrived since the last summary. \
+            Weight the new lines heavily — your summary should primarily reflect \
+            what has been said recently. Use the older lines only to maintain \
+            continuity of topic. \
+            If the topic or summary has not meaningfully changed, return them \
+            exactly as they were. Only update when the recent content warrants it. \
             Always reply in exactly two lines: \
             "Topic: <short phrase>" and "Summary: <two sentences>". \
             Do not include any other text.
@@ -110,7 +115,8 @@ actor TopicSummarizer {
     // MARK: - Prompt
 
     private func buildPrompt(
-        translations: [String],
+        contextLines: [String],
+        newLines: [String],
         previous: TranscriptSummary?
     ) -> String {
         var p = ""
@@ -120,8 +126,14 @@ actor TopicSummarizer {
             p += "Previous summary: \(prev.summary)\n\n"
         }
 
-        p += "Recent transcript (last ~5 minutes):\n"
-        p += translations.joined(separator: "\n")
+        if !contextLines.isEmpty {
+            p += "Earlier context (background only):\n"
+            p += contextLines.joined(separator: "\n")
+            p += "\n\n"
+        }
+
+        p += "New lines since last summary (focus here):\n"
+        p += newLines.isEmpty ? "(none yet)" : newLines.joined(separator: "\n")
 
         return p
     }

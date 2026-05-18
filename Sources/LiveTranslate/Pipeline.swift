@@ -115,6 +115,7 @@ final class Pipeline: ObservableObject {
 
     private var summaryLoopTask: Task<Void, Never>? = nil
     private var lastSummary: TranscriptSummary? = nil
+    private var lastSummaryAt: Date? = nil
 
     private var runTask: Task<Void, Never>?
     /// Shared JSONL archive — sentences from all sources interleave
@@ -709,32 +710,40 @@ final class Pipeline: ObservableObject {
         summaryLoopTask?.cancel()
         summaryLoopTask = nil
         lastSummary = nil
+        lastSummaryAt = nil
         transcriptSummary = nil
     }
 
     private func runOneSummaryCycle(summarizer: TopicSummarizer) async {
-        let (recentTexts, previous): ([String], TranscriptSummary?) = await MainActor.run { [weak self] in
-            guard let self else { return ([], nil) }
-            let cutoff = Date().addingTimeInterval(-5 * 60)
-            let texts = self.sentences
-                .filter { $0.createdAt >= cutoff }
+        let (contextLines, newLines, previous): ([String], [String], TranscriptSummary?) = await MainActor.run { [weak self] in
+            guard let self else { return ([], [], nil) }
+            let contextCutoff = Date().addingTimeInterval(-5 * 60)
+            let newCutoff = self.lastSummaryAt ?? Date().addingTimeInterval(-60)
+            let recent = self.sentences.filter { $0.createdAt >= contextCutoff }
+            let context = recent
+                .filter { $0.createdAt < newCutoff }
                 .map { s in s.translation.isEmpty ? s.text : s.translation }
-            return (texts, self.lastSummary)
+            let new = recent
+                .filter { $0.createdAt >= newCutoff }
+                .map { s in s.translation.isEmpty ? s.text : s.translation }
+            return (context, new, self.lastSummary)
         }
 
-        guard recentTexts.count >= 3 else {
-            Log.line("TopicSummarizer: \(recentTexts.count) sentences — skipping (need ≥ 3)")
+        guard (contextLines + newLines).count >= 3 else {
+            Log.line("TopicSummarizer: \((contextLines + newLines).count) sentences — skipping (need ≥ 3)")
             return
         }
 
         do {
             let result = try await summarizer.summarize(
-                translations: recentTexts,
+                contextLines: contextLines,
+                newLines: newLines,
                 previous: previous
             )
             await MainActor.run { [weak self] in
                 self?.transcriptSummary = result
                 self?.lastSummary = result
+                self?.lastSummaryAt = Date()
             }
             Log.line("TopicSummarizer: topic=\(result.topic)")
         } catch {

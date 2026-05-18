@@ -182,12 +182,7 @@ struct TranscriptView: View {
                     .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 5)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.ultraThinMaterial.opacity(0.5))
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .padding(.horizontal, 8)
             .transition(.opacity.combined(with: .move(edge: .top)))
         }
     }
