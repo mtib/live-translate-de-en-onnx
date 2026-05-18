@@ -284,7 +284,7 @@ struct TranscriptView: View {
 /// One entry in the unified transcript list. Both variants carry the
 /// same UUID across graduation, so SwiftUI's diffing sees an in-place
 /// content update rather than a remove + insert.
-private enum DisplayRow: Identifiable, Equatable {
+enum DisplayRow: Identifiable, Equatable {
     case sentence(Sentence)
     case inflight(InflightChunk)
 
@@ -333,7 +333,7 @@ private enum DisplayRow: Identifiable, Equatable {
 ///   `.translating(text)`            → italic "translating" + caption
 ///   `.sentence`                     → identical layout to `.partial(text, translation)`
 ///                                      so the graduation swap is invisible.
-private struct TranscriptRow: View {
+struct TranscriptRow: View {
     let row: DisplayRow
     let compact: Bool
 
@@ -415,7 +415,7 @@ private struct TranscriptRow: View {
 /// selectable text (with a copy button) and a QR code generated via
 /// CoreImage's `CIQRCodeGenerator`. The QR is regenerated each time
 /// the URL changes — cheap, no caching needed for a 240×240 image.
-private struct StreamShareView: View {
+struct StreamShareView: View {
     let url: String
 
     var body: some View {

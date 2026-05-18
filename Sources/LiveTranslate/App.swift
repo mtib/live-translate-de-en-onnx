@@ -51,41 +51,18 @@ struct LiveTranslateApp: App {
             }
         }
 
-        // Status-bar icon. Icon fills when recording so it's obvious at
-        // a glance without opening the overlay. Clicking the icon opens
-        // the menu; the window floats independently of app-activation
-        // state so it stays above full-screen content without stealing
-        // focus from whatever the user is watching.
+        // Status-bar icon. Clicking shows the compact transcript popover.
+        // Icon fills while recording so state is visible at a glance.
         MenuBarExtra {
-            Button(isWindowVisible ? "Hide overlay" : "Show overlay") {
-                if isWindowVisible {
-                    mainWindow?.orderOut(nil)
-                } else {
-                    // orderFrontRegardless keeps focus in the full-screen
-                    // app rather than switching away from it.
-                    mainWindow?.orderFrontRegardless()
-                }
-                isWindowVisible.toggle()
-            }
-            .keyboardShortcut("l", modifiers: [.command, .shift])
-
-            Divider()
-
-            Button(pipeline.isRunning ? "Stop" : "Start") {
-                pipeline.toggle()
-            }
-
-            Divider()
-
-            Button("Quit LiveTranslate") {
-                NSApp.terminate(nil)
-            }
-            .keyboardShortcut("q")
+            MenuBarView(
+                pipeline: pipeline,
+                isWindowVisible: $isWindowVisible,
+                mainWindow: mainWindow
+            )
         } label: {
-            // Filled variant signals "recording in progress" so the user
-            // can see at a glance without opening the overlay.
             Image(systemName: pipeline.isRunning ? "waveform.circle.fill" : "waveform.circle")
         }
+        .menuBarExtraStyle(.window)
     }
 
     /// Registers (once) for `NSApplication.willTerminateNotification` so
