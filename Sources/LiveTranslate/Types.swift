@@ -238,3 +238,13 @@ protocol Transcriber {
 protocol Translator {
     func translate(_ text: String) async throws -> String
 }
+
+/// LLM-generated topic label and short summary of the current conversation.
+/// Produced by `TopicSummarizer` and published on `Pipeline.transcriptSummary`.
+/// Shown in both `TranscriptView` and `MenuBarView` while a session is running.
+struct TranscriptSummary: Equatable {
+    /// Short phrase describing the topic, e.g. "Microservice design trade-offs".
+    let topic: String
+    /// One or two sentences summarising the most recent exchange.
+    let summary: String
+}
