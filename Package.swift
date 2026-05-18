@@ -1,9 +1,9 @@
-// swift-tools-version:6.0
+// swift-tools-version:6.2
 import PackageDescription
 
 let package = Package(
     name: "LiveTranslate",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v26)],
     targets: [
         // RNNoise (xiph, BSD 3-clause), pinned to v0.1.1 where the model
         // weights are embedded in the C sources (no runtime download).
