@@ -47,7 +47,7 @@ The user keeps `export LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev` in `~/.zshr
   the Apple Translation APIs are awkward under Swift 6 strict concurrency (in
   particular the `AsyncStream<Never>` parking trick in `.translationTask` and the
   `@MainActor`-load-bearing translation dispatch).
-- macOS deployment target: `.macOS(.v15)`.
+- macOS deployment target: `.macOS(.v26)` — bumped from v15 to enable the `FoundationModels` framework (Apple Intelligence on-device LLM). Requires swift-tools-version 6.2.
 - **No CMake.** sherpa-onnx comes as pre-built dylibs — the `CSherpaOnnx` bridge
   target links against `external/sherpa-onnx/lib/` at build time.
 
@@ -354,6 +354,7 @@ flowchart TD
 |---|---|
 | `App.swift` | `@main` entry. Configures `NSWindow`: level `.statusBar` (above full-screen app content), translucent, movable from anywhere, `canJoinAllSpaces`, traffic lights hidden, `fullSizeContentView`. Adds a `MenuBarExtra` status-bar icon (filled when recording) with Show/Hide overlay, Start/Stop, and Quit items. Captures `mainWindow` via `WindowAccessor` for the Show/Hide action. Installs `NSApplication.willTerminateNotification` hook to flush pending sentences on Cmd+Q. Runs `CrashRecovery.recoverPendingSessions()` detached at launch. |
 | `TranscriptView.swift` | The whole UI. No language pickers — compile-time constant. Shows `"\(ModelConfig.sourceLanguage) → \(ModelConfig.targetLanguage)"` label. Hosts `.translationTask` (the only way to get a `TranslationSession`), parks the closure via `AsyncStream<Never>` to hold the session alive. `displayRows` merges `sentences + inflightChunks` into `[DisplayRow]` keyed by UUID for flicker-free graduation. `TranscriptRow` handles all `DisplayRow` states. `StreamShareView` popover shows URL + QR code. |
+| `TopicSummarizer.swift` | `actor` using Apple FoundationModels. Creates a fresh `LanguageModelSession` per 60-second cycle (no stale conversation history). `isAvailable()` checks `SystemLanguageModel.default.availability` before starting. Free-text generation (not `@Generable` — the macro plugin is not available in CLI builds); parses `Topic:` and `Summary:` lines from output. |
 | `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns `sentences`, `inflightChunks`, `translationCache`, `partialTranslationTimers`, `ttsSpeaker`, `liveAudioServer`, `ttsActive`, `ttsListenerCount`, `ttsModelLoaded`. Wires `onChunkLifecycle` in `init`. No persisted settings (language is compile-time). No source/target pickers. `applyLifecycle` is the state machine for all chunk events. |
 | `SourcePipeline.swift` | Per-stream pipeline. Owns `AudioRecorder`. Runs `runRecordingLoop` + `runRecognitionCycle` as concurrent async-let children. The `SessionSnapshot` stream from `transcribe()` is drained but ignored — lifecycle callbacks drive everything. |
 | `Types.swift` | `SourceLocale`, `TargetLanguage`, `SourceTag` (`.mic` / `.system`, with `iconSystemName` and `shortLabel`), `InflightChunk` (with `.listening`, `.partial(text:translation:)`, `.translating(text:)` — NO `.transcribing`), `Sentence`, `PipelineStatus`, `SessionSentence`, `SessionSnapshot`. Protocols: `AudioSource`, `Transcriber`, `Translator`. |
@@ -622,6 +623,7 @@ future builds reuse the grant.
 - `Translation` (`TranslationSession`, `.translationTask`) — Apple on-device translation
 - `Network` (`NWListener`, `NWConnection`) — live audio HTTP server
 - `CoreImage` (`CIQRCodeGenerator`) — QR code for stream share popover
+- `FoundationModels` (`LanguageModelSession`, `SystemLanguageModel`) — on-device Apple Intelligence LLM for topic+summary generation; zero dependencies, model built into macOS 26
 - SwiftUI
 
 ---
@@ -641,6 +643,7 @@ future builds reuse the grant.
 - [x] Crosstalk suppression — both broadcaster AND recognizer see muted audio
 - [x] Per-run temp dir → zip → `~/Documents/LiveTranslate/`
 - [x] CrashRecovery — finalize leftover work dirs on next launch
+- [x] On-device LLM topic+summary loop — Apple FoundationModels, every 60 s, shows topic label + 2-sentence summary in overlay and popover; gracefully skipped if Apple Intelligence unavailable
 - [ ] Speaker diarization — campplus embedding was scaffolded but never completed;
   currently not active anywhere in the codebase
 - [ ] Retargeting to other language pairs — change `ModelConfig.sourceLanguage /
