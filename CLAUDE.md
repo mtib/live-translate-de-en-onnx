@@ -897,3 +897,17 @@ tccutil reset ScreenCapture local.mtib.livetranslate
     `setpts=PTS-STARTPTS+<offset>/TB` in the filter graph so it lands at the right
     spot on the audio timeline. Forgetting any one of those three (PTS session start,
     offset sidecar, filter setpts) gives a video that drifts away from the SRT cues.
+
+38. **SCK stream silently dies ~44 s in on macOS 26 (`.macOS(.v26)` deployment target).**
+    When the deployment target was bumped from v15 to v26, macOS started stopping the
+    `SCStream` with `"Stream was stopped by the system"` (~44 s in). The SCStreamDelegate
+    method `didStopWithError` was previously a no-op log line, so the broadcaster was
+    never finished and the downstream pipeline drained. The `-3808` "already stopped"
+    error at pipeline shutdown was a symptom of this. Fix: in `didStopWithError`, check
+    `intentionalStop` (set in `stop()` before `stopCapture()`) to distinguish
+    system-initiated from user-initiated stops. On a system stop, spawn an
+    `attemptReconnect()` task that re-calls `start()` with exponential backoff (1 s →
+    2 s → 4 s → 8 s → 16 s). The broadcaster is deliberately NOT finished between
+    attempts — downstream for-await loops remain alive and resume receiving audio as
+    soon as capture restarts. `broadcaster.finishAll()` is called only if all five
+    attempts exhaust.

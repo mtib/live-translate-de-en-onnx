@@ -19,6 +19,13 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
     private var stream: SCStream?
     private let sampleQueue = DispatchQueue(label: "SystemAudioSource.samples", qos: .userInteractive)
 
+    /// Set to `true` in `stop()` before calling `stopCapture()` so that
+    /// `didStopWithError` knows not to attempt a reconnect on a user-initiated stop.
+    private var intentionalStop = false
+
+    /// In-flight reconnect task; cancelled on `stop()`.
+    private var reconnectTask: Task<Void, Never>?
+
     private let broadcaster = BufferBroadcaster()
     var buffers: AsyncStream<AVAudioPCMBuffer> { broadcaster.stream }
 
@@ -62,13 +69,20 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
     /// rapid Stop→Start cycles could race the new stream against the
     /// not-yet-stopped previous one.
     func stop() async {
-        guard let stream else { return }
+        intentionalStop = true
+        // Cancel any in-flight reconnect so it doesn't race the teardown.
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        let streamToStop = self.stream
         self.stream = nil
-        do { try await stream.stopCapture() }
-        catch { Log.line("SystemAudio: stopCapture error: \(error)") }
+        if let streamToStop {
+            do { try await streamToStop.stopCapture() }
+            catch { Log.line("SystemAudio: stopCapture error: \(error)") }
+        }
         // Close every live `buffers` subscription so consumers' for-await
         // loops exit naturally on Stop.
         broadcaster.finishAll()
+        intentionalStop = false
         Log.line("SystemAudio: capture stopped")
     }
 
@@ -87,6 +101,45 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         Log.line("SystemAudio: stream stopped with error: \(error.localizedDescription)")
+        // Guard against user-initiated stops: `stop()` sets `intentionalStop = true`
+        // before calling `stopCapture()`, which is what fires this delegate.
+        guard !intentionalStop else { return }
+        // System stopped the stream unexpectedly — nil out the dead stream and
+        // attempt to restart it so the downstream pipeline keeps receiving audio.
+        self.stream = nil
+        reconnectTask?.cancel()
+        reconnectTask = Task { [weak self] in
+            await self?.attemptReconnect()
+        }
+    }
+
+    // MARK: - Reconnect
+
+    /// Attempts to restart SCK audio capture after a system-initiated stop.
+    /// Uses exponential backoff (1 s → 2 s → 4 s → 8 s → 16 s) before giving up.
+    /// The `broadcaster` is deliberately NOT finished between attempts so that
+    /// downstream consumers (DenoisingAudioSource for-await loops) remain alive
+    /// and resume receiving audio as soon as capture restarts. `finishAll()` is
+    /// only called after all attempts are exhausted.
+    private func attemptReconnect() async {
+        let delays: [Duration] = [
+            .seconds(1), .seconds(2), .seconds(4), .seconds(8), .seconds(16)
+        ]
+        for (index, delay) in delays.enumerated() {
+            guard !Task.isCancelled else { return }
+            Log.line("SystemAudio: reconnect attempt \(index + 1)/\(delays.count), waiting \(delay)…")
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            do {
+                try await start()
+                Log.line("SystemAudio: reconnected successfully (attempt \(index + 1))")
+                return
+            } catch {
+                Log.line("SystemAudio: reconnect attempt \(index + 1) failed: \(error.localizedDescription)")
+            }
+        }
+        Log.line("SystemAudio: all reconnect attempts exhausted — closing broadcaster")
+        broadcaster.finishAll()
     }
 
     // MARK: - Sample conversion

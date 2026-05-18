@@ -13,27 +13,11 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             compactBar
-            if let s = pipeline.transcriptSummary {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(s.topic)
-                        .font(.caption.bold())
-                        .lineLimit(1)
-                    Text(s.summary)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 4)
-                .transition(.opacity)
-            }
             sentenceList
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .frame(width: 340)
-        .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary != nil)
     }
 
     // MARK: - Bar
@@ -41,13 +25,37 @@ struct MenuBarView: View {
     private var compactBar: some View {
         HStack(spacing: 6) {
             primaryButton
-            Text("\(ModelConfig.sourceLanguage) → \(ModelConfig.targetLanguage)")
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.secondary)
+            if let topic = pipeline.transcriptSummary?.topic {
+                Text(topic)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             Spacer(minLength: 4)
+            aiToggleButton
             ScreenPickButton(pipeline: pipeline)
             streamShareButton
             overlayToggleButton
+        }
+        .animation(.easeInOut(duration: 0.2), value: pipeline.transcriptSummary?.topic)
+    }
+
+    @ViewBuilder
+    private var aiToggleButton: some View {
+        if pipeline.aiAnalysisAvailable {
+            Button {
+                pipeline.aiAnalysisEnabled.toggle()
+            } label: {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(
+                        pipeline.aiAnalysisEnabled
+                            ? Color.accentColor
+                            : Color.secondary
+                    )
+            }
+            .buttonStyle(.plain)
+            .help(pipeline.aiAnalysisEnabled ? "Disable AI analysis" : "Enable AI analysis")
         }
     }
 
@@ -134,6 +142,28 @@ struct MenuBarView: View {
             // ~6 compact rows: callout font (~16pt) + 6pt spacing = ~22pt/row
             .frame(minHeight: 50, maxHeight: 132)
             .scrollIndicators(.hidden)
+            // Summary sits here (not in parent VStack) so its appearance never
+            // changes the ScrollView frame — safeAreaInset adjusts content
+            // offset instead, keeping the bottom anchor stable.
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if let s = pipeline.transcriptSummary {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(s.topic)
+                            .font(.caption.bold())
+                            .lineLimit(1)
+                        Text(s.summary)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4)
+                    .background(.regularMaterial)
+                    .transition(.opacity)
+                    .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary != nil)
+                }
+            }
             .onChange(of: displayRows.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.12)) {
                     proxy.scrollTo("BOTTOM", anchor: .bottom)

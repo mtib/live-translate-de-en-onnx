@@ -72,67 +72,86 @@ struct TranscriptView: View {
         if compactMode {
             VStack(alignment: .leading, spacing: 6) {
                 compactBar
-                summaryBar
                 sentenceList(compact: true)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary != nil)
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 fullBar
                 if case .stopped(let reason) = pipeline.status {
                     errorBanner(reason)
                 }
-                summaryBar
                 sentenceList(compact: false)
             }
             .padding(14)
-            .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary != nil)
         }
     }
 
     // MARK: - Bars
 
-    /// Compact bar: primary action, language pair label, expand.
+    /// Compact bar: primary action, current topic (if any), icon row.
     /// In-flight activity is shown in the sentence list itself (one
     /// row per active chunk), so the bar stays minimal.
     private var compactBar: some View {
         HStack(spacing: 6) {
             primaryButton(compact: true)
-            Text("\(pipeline.source.identifier.prefix(2)) → \(pipeline.target.code)")
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.secondary)
+            if let topic = pipeline.transcriptSummary?.topic {
+                Text(topic)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             Spacer(minLength: 4)
+            aiToggleButton
             ScreenPickButton(pipeline: pipeline)
             streamShareButton
             iconButton("chevron.down", help: "Show controls") {
                 compactMode = false
             }
         }
+        .animation(.easeInOut(duration: 0.2), value: pipeline.transcriptSummary?.topic)
     }
 
-    /// Full bar: primary action, language pair label, compact toggle.
-    /// Language pair is a compile-time constant (ModelConfig.sourceLanguage →
-    /// ModelConfig.targetLanguage) — no runtime picker.
+    /// Full bar: primary action, current topic (if any), icon row.
     private var fullBar: some View {
         HStack(spacing: 10) {
             primaryButton(compact: false)
-            Text("\(ModelConfig.sourceLanguage) → \(ModelConfig.targetLanguage)")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(.secondary.opacity(0.1))
-                )
+            if let topic = pipeline.transcriptSummary?.topic {
+                Text(topic)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             Spacer(minLength: 6)
+            aiToggleButton
             ScreenPickButton(pipeline: pipeline)
             streamShareButton
             iconButton("chevron.up", help: "Compact view") {
                 compactMode = true
             }
+        }
+        .animation(.easeInOut(duration: 0.2), value: pipeline.transcriptSummary?.topic)
+    }
+
+    /// Sparkle toggle — only shown when Apple Intelligence is available.
+    /// Tinted accent when on, secondary when off.
+    @ViewBuilder
+    private var aiToggleButton: some View {
+        if pipeline.aiAnalysisAvailable {
+            Button {
+                pipeline.aiAnalysisEnabled.toggle()
+            } label: {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(
+                        pipeline.aiAnalysisEnabled
+                            ? Color.accentColor
+                            : Color.secondary
+                    )
+            }
+            .buttonStyle(.plain)
+            .help(pipeline.aiAnalysisEnabled ? "Disable AI analysis" : "Enable AI analysis")
         }
     }
 
@@ -288,6 +307,17 @@ struct TranscriptView: View {
             }
             .frame(minHeight: compact ? 50 : 140)
             .scrollIndicators(.hidden)
+            // The summary bar lives here rather than in the parent VStack so that
+            // its appearance / resize never changes the ScrollView's frame. A
+            // safeAreaInset adjusts the scroll content's offset instead — the
+            // bottom anchor stays put and there is no visible scroll jump.
+            .safeAreaInset(edge: .top, spacing: 0) {
+                summaryBar
+                    .padding(.vertical, 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(nsColor: .textBackgroundColor).opacity(0.85))
+                    .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary != nil)
+            }
             .onChange(of: displayRows.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.12)) {
                     proxy.scrollTo("BOTTOM", anchor: .bottom)

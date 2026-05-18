@@ -62,8 +62,28 @@ final class Pipeline: ObservableObject {
     @Published private(set) var liveStreamURL: String?
 
     /// Rolling topic label + two-sentence summary produced by `TopicSummarizer`.
-    /// Nil when no session is active or Apple Intelligence is unavailable.
+    /// Nil when no session is active, Apple Intelligence is unavailable, or
+    /// `aiAnalysisEnabled` is false.
     @Published var transcriptSummary: TranscriptSummary? = nil
+
+    /// Whether the on-device AI topic+summary loop is enabled.
+    /// Persisted in UserDefaults so the preference survives app restarts.
+    /// Defaults to `true` on first launch (key absent in UserDefaults).
+    @Published var aiAnalysisEnabled: Bool =
+        UserDefaults.standard.object(forKey: "aiAnalysisEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(aiAnalysisEnabled, forKey: "aiAnalysisEnabled")
+            if aiAnalysisEnabled {
+                if isRunning { startSummaryLoop() }
+            } else {
+                stopSummaryLoop()   // also clears transcriptSummary
+            }
+        }
+    }
+
+    /// True when the on-device Apple Intelligence model is available for the
+    /// topic+summary feature. Used to gate the sparkle toggle in the UI.
+    var aiAnalysisAvailable: Bool { TopicSummarizer.isAvailable() }
 
     /// True while the TTS pipeline is doing real work — the model has
     /// finished its lazy load AND there's at least one listener
@@ -686,7 +706,7 @@ final class Pipeline: ObservableObject {
         }
 
         status = .running
-        startSummaryLoop()
+        if aiAnalysisEnabled { startSummaryLoop() }
 
         // 5. Background prune loop (the translation worker is gone —
         //    translation happens inline in the lifecycle handler).
@@ -853,18 +873,30 @@ final class Pipeline: ObservableObject {
         transcriptSummary = nil
     }
 
+    // Hard caps on lines sent to the on-device LLM per cycle.
+    // The context window of the Apple Intelligence on-device model is limited;
+    // exceeding it degrades output quality silently. We keep the MOST RECENT
+    // lines in each bucket (oldest dropped first) so the model always sees
+    // the freshest content. These numbers keep total token use well inside the
+    // model's window even for verbose speakers.
+    private static let maxSummaryContextLines = 20   // background / older lines
+    private static let maxSummaryNewLines     = 30   // lines since last cycle
+
     private func runOneSummaryCycle(summarizer: TopicSummarizer) async {
         let (contextLines, newLines, previous): ([String], [String], TranscriptSummary?) = await MainActor.run { [weak self] in
             guard let self else { return ([], [], nil) }
             let contextCutoff = Date().addingTimeInterval(-5 * 60)
             let newCutoff = self.lastSummaryAt ?? Date().addingTimeInterval(-60)
             let recent = self.sentences.filter { $0.createdAt >= contextCutoff }
-            let context = recent
+            // .suffix keeps the tail (most recent); oldest are dropped silently.
+            let context = Array(recent
                 .filter { $0.createdAt < newCutoff }
                 .map { s in s.translation.isEmpty ? s.text : s.translation }
-            let new = recent
+                .suffix(Pipeline.maxSummaryContextLines))
+            let new = Array(recent
                 .filter { $0.createdAt >= newCutoff }
                 .map { s in s.translation.isEmpty ? s.text : s.translation }
+                .suffix(Pipeline.maxSummaryNewLines))
             return (context, new, self.lastSummary)
         }
 
