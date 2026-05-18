@@ -60,6 +60,20 @@ final class Pipeline: ObservableObject {
     /// QR code so a phone-with-headphones can listen along.
     @Published private(set) var liveStreamURL: String?
 
+    /// True while the TTS pipeline is doing real work — the model has
+    /// finished its lazy load AND there's at least one listener
+    /// connected to `/live.wav`. UI shows this as a green stream
+    /// icon. Flips off when the last listener disconnects (the model
+    /// stays resident for the rest of the session, but it's no longer
+    /// being driven).
+    @Published private(set) var ttsActive: Bool = false
+
+    /// Backing flags for `ttsActive`. Set by callbacks from the
+    /// speaker / server hopping back to MainActor; combined in
+    /// `recomputeTTSActive()`.
+    private var ttsModelLoaded = false
+    private var ttsListenerCount = 0
+
     // MARK: - Language (compile-time constant)
 
     /// Source language — compile-time constant from ModelConfig.
@@ -432,6 +446,9 @@ final class Pipeline: ObservableObject {
             liveAudioServer?.stop()
             liveAudioServer = nil
             liveStreamURL = nil
+            ttsModelLoaded = false
+            ttsListenerCount = 0
+            recomputeTTSActive()
             if restartRequested {
                 restartRequested = false
                 sentences = []
@@ -524,7 +541,18 @@ final class Pipeline: ObservableObject {
                     server?.append(pcm)
                 }, onActivityChanged: { [weak server] active in
                     server?.setSpeaking(active)
+                }, onModelLoaded: { [weak self] in
+                    Task { @MainActor [weak self] in
+                        self?.ttsModelLoaded = true
+                        self?.recomputeTTSActive()
+                    }
                 })
+                server.onAudioListenerCountChanged = { [weak self] count in
+                    Task { @MainActor [weak self] in
+                        self?.ttsListenerCount = count
+                        self?.recomputeTTSActive()
+                    }
+                }
                 self.liveAudioServer = server
                 self.ttsSpeaker = speaker
                 self.liveStreamURL = LiveAudioServer.streamURL(port: liveStreamPort)
@@ -624,6 +652,13 @@ final class Pipeline: ObservableObject {
             }
             i -= 1
         }
+    }
+
+    /// Recompute `ttsActive` from the two backing flags. Called
+    /// whenever either changes (load completion, listener count
+    /// fluctuation) or when the stream is torn down at run end.
+    private func recomputeTTSActive() {
+        ttsActive = ttsModelLoaded && ttsListenerCount > 0
     }
 
     private func enforceMaxCount() {

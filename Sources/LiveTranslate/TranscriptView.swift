@@ -134,6 +134,9 @@ struct TranscriptView: View {
     /// live (i.e. the target language has a voice installed and
     /// src != tgt). Click pops a small panel with the stream URL
     /// (copyable) and a QR code of the same URL for phone listeners.
+    /// Tints green while a listener is connected AND the TTS model has
+    /// finished its lazy load (i.e. the speaker is actively producing
+    /// audio for someone).
     @State private var streamShareShown: Bool = false
     @ViewBuilder
     private var streamShareButton: some View {
@@ -143,10 +146,13 @@ struct TranscriptView: View {
             } label: {
                 Image(systemName: "dot.radiowaves.left.and.right")
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(
+                        pipeline.ttsActive ? AnyShapeStyle(.green) : AnyShapeStyle(.secondary)
+                    )
+                    .animation(.easeInOut(duration: 0.25), value: pipeline.ttsActive)
             }
             .buttonStyle(.plain)
-            .help("Live translated-audio stream")
+            .help(pipeline.ttsActive ? "Live audio stream — listener connected" : "Live translated-audio stream")
             .popover(isPresented: $streamShareShown, arrowEdge: .bottom) {
                 StreamShareView(url: url)
                     .padding(16)

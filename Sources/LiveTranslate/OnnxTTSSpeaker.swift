@@ -29,6 +29,7 @@ final class OnnxTTSSpeaker: @unchecked Sendable {
 
     private let onPCM: (Data) -> Void
     private let onActivityChanged: (Bool) -> Void
+    private let onModelLoaded: () -> Void
 
     private let q = DispatchQueue(label: "OnnxTTSSpeaker.queue")
     private var pending: [String] = []
@@ -43,9 +44,11 @@ final class OnnxTTSSpeaker: @unchecked Sendable {
     // MARK: — Init
 
     init(onPCM: @escaping (Data) -> Void,
-         onActivityChanged: @escaping (Bool) -> Void = { _ in }) {
+         onActivityChanged: @escaping (Bool) -> Void = { _ in },
+         onModelLoaded: @escaping () -> Void = { }) {
         self.onPCM = onPCM
         self.onActivityChanged = onActivityChanged
+        self.onModelLoaded = onModelLoaded
         // Don't load the model here — wait until the first `enqueue`
         // call with a real client connected. Saves ~50 MB + ~1 s of
         // setup when nobody ever opens the listen page this run.
@@ -127,6 +130,7 @@ final class OnnxTTSSpeaker: @unchecked Sendable {
         tts = t
         sampleRate = SherpaOnnxOfflineTtsSampleRate(t)
         Log.line("OnnxTTSSpeaker: kitten-mini loaded on-demand, sampleRate=\(sampleRate) Hz")
+        onModelLoaded()
     }
 
     private func pumpLocked() {

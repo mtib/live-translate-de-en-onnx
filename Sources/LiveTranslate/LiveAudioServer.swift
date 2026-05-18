@@ -64,6 +64,13 @@ final class LiveAudioServer: @unchecked Sendable {
         return audioSubscribers.count
     }
 
+    /// Fired whenever the `/live.wav` subscriber count changes. The
+    /// pipeline uses this to drive the "TTS active" UI indicator and
+    /// could in principle gate other listener-aware optimizations.
+    /// Called off the main thread; hop to MainActor before touching
+    /// `@Published` state.
+    var onAudioListenerCountChanged: (@Sendable (Int) -> Void)?
+
     init(port: UInt16) {
         self.port = port
     }
@@ -180,14 +187,19 @@ final class LiveAudioServer: @unchecked Sendable {
             let id = UUID()
             self.lock.lock()
             self.audioSubscribers[id] = conn
+            let newCount = self.audioSubscribers.count
             self.lock.unlock()
             Log.line("LiveAudioServer: audio subscriber +1 (id=\(id.uuidString.prefix(8)))")
+            self.onAudioListenerCountChanged?(newCount)
             conn.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .cancelled, .failed:
-                    self?.lock.lock()
-                    self?.audioSubscribers.removeValue(forKey: id)
-                    self?.lock.unlock()
+                    guard let self else { return }
+                    self.lock.lock()
+                    self.audioSubscribers.removeValue(forKey: id)
+                    let count = self.audioSubscribers.count
+                    self.lock.unlock()
+                    self.onAudioListenerCountChanged?(count)
                 default: break
                 }
             }
