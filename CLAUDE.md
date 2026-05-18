@@ -604,6 +604,7 @@ future builds reuse the grant.
 - Traffic lights hidden. Use Cmd+Q or the status-bar menu to quit.
 - `MenuBarExtra` scene: icon is `waveform.circle` at rest, `waveform.circle.fill` while recording. Menu items: Show/Hide overlay (Cmd+Shift+L), Start/Stop, Quit.
 - Show/Hide uses `orderFrontRegardless()` (not `makeKeyAndOrderFront`) so bringing the overlay back does not steal focus from a full-screen app — the whole point of the overlay is to be non-intrusive.
+- `NSWorkspace.activeSpaceDidChangeNotification` observer calls `orderFrontRegardless()` after every Space transition. `.canJoinAllSpaces` puts the window into a full-screen Space automatically, but macOS does not re-raise it above the full-screen app's content — it just sits there invisible. The observer fires after the transition completes and brings it to front. Skipped when `window.isVisible == false` (user explicitly hid the overlay).
 - `mainWindow: NSWindow?` is captured via `WindowAccessor` into an App-level `@State` so the menu-bar Show/Hide button can order the window without searching `NSApp.windows`.
 - Compact mode: `@AppStorage("compactMode")` — hides the full bar, shows a slim bar.
 

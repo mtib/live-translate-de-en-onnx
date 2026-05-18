@@ -117,10 +117,13 @@ struct LiveTranslateApp: App {
         window.backgroundColor = .clear
         window.isOpaque = false
         window.hasShadow = true
-        // .statusBar (level 25) clears full-screen app content in Mission
-        // Control spaces. .floating (3) does not. Stays below the system
-        // menu bar itself (level 24 is mainMenu, but the bar renders above
-        // any window at its own level), so nothing looks broken there.
+        // .statusBar (level 25) is above full-screen app content nominally,
+        // but macOS does not re-assert z-order on Space transitions — the
+        // window exists in the new Space but renders behind the full-screen
+        // app until explicitly ordered front. The activeSpaceDidChange
+        // observer below handles that. Level stays at .statusBar rather than
+        // something extreme like .screenSaver so system UI still renders
+        // above us where expected.
         window.level = .statusBar
         // Extend our content into the title-bar area so the hidden
         // traffic-light strip doesn't leave a dead band of background
@@ -135,6 +138,22 @@ struct LiveTranslateApp: App {
         window.standardWindowButton(.closeButton)?.isHidden = true
         window.standardWindowButton(.miniaturizeButton)?.isHidden = true
         window.standardWindowButton(.zoomButton)?.isHidden = true
+
+        // Re-assert z-order on every Space transition. canJoinAllSpaces
+        // puts the window into the new Space automatically, but macOS
+        // does not re-raise it above full-screen app content — it just
+        // sits there invisible behind Discord/YouTube/etc. Calling
+        // orderFrontRegardless() after the transition fixes that.
+        // We skip the call when the user has explicitly hidden the overlay
+        // (isVisible == false after orderOut).
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak window] _ in
+            guard window?.isVisible == true else { return }
+            window?.orderFrontRegardless()
+        }
     }
 }
 
