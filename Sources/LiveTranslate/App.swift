@@ -3,6 +3,9 @@ import SwiftUI
 @main
 struct LiveTranslateApp: App {
     @StateObject private var pipeline = Pipeline()
+    /// Captured once by `WindowAccessor` so the menu-bar Show/Hide action
+    /// can order the window in/out without going through NSApp.windows.
+    @State private var mainWindow: NSWindow?
 
     init() {
         Log.startup()  // truncates the log if it's grown past the cap
@@ -19,6 +22,7 @@ struct LiveTranslateApp: App {
             TranscriptView(pipeline: pipeline)
                 .frame(minWidth: 260, minHeight: 80)
                 .background(WindowAccessor { window in
+                    mainWindow = window
                     configure(window)
                 })
                 .onAppear { installTerminateHook(pipeline: pipeline) }
@@ -40,6 +44,41 @@ struct LiveTranslateApp: App {
                 }
                 .keyboardShortcut("k", modifiers: [.command, .shift])
             }
+        }
+
+        // Status-bar icon. Icon fills when recording so it's obvious at
+        // a glance without opening the overlay. Clicking the icon opens
+        // the menu; the window floats independently of app-activation
+        // state so it stays above full-screen content without stealing
+        // focus from whatever the user is watching.
+        MenuBarExtra {
+            Button(mainWindow?.isVisible == true ? "Hide overlay" : "Show overlay") {
+                if mainWindow?.isVisible == true {
+                    mainWindow?.orderOut(nil)
+                } else {
+                    // orderFront without activating — keeps focus in the
+                    // full-screen app rather than switching away from it.
+                    mainWindow?.orderFrontRegardless()
+                }
+            }
+            .keyboardShortcut("l", modifiers: [.command, .shift])
+
+            Divider()
+
+            Button(pipeline.isRunning ? "Stop" : "Start") {
+                pipeline.toggle()
+            }
+
+            Divider()
+
+            Button("Quit LiveTranslate") {
+                NSApp.terminate(nil)
+            }
+            .keyboardShortcut("q")
+        } label: {
+            // Filled variant signals "recording in progress" so the user
+            // can see at a glance without opening the overlay.
+            Image(systemName: pipeline.isRunning ? "waveform.circle.fill" : "waveform.circle")
         }
     }
 
@@ -72,7 +111,11 @@ struct LiveTranslateApp: App {
         window.backgroundColor = .clear
         window.isOpaque = false
         window.hasShadow = true
-        window.level = .floating
+        // .statusBar (level 25) clears full-screen app content in Mission
+        // Control spaces. .floating (3) does not. Stays below the system
+        // menu bar itself (level 24 is mainMenu, but the bar renders above
+        // any window at its own level), so nothing looks broken there.
+        window.level = .statusBar
         // Extend our content into the title-bar area so the hidden
         // traffic-light strip doesn't leave a dead band of background
         // above the controls. The View ignores the safe area to match.

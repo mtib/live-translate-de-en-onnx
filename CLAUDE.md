@@ -352,7 +352,7 @@ flowchart TD
 
 | File | Role |
 |---|---|
-| `App.swift` | `@main` entry. Configures `NSWindow`: floating, translucent, movable from anywhere, `canJoinAllSpaces`, traffic lights hidden, `fullSizeContentView`. Installs `NSApplication.willTerminateNotification` hook to flush pending sentences on Cmd+Q. Runs `CrashRecovery.recoverPendingSessions()` detached at launch. |
+| `App.swift` | `@main` entry. Configures `NSWindow`: level `.statusBar` (above full-screen app content), translucent, movable from anywhere, `canJoinAllSpaces`, traffic lights hidden, `fullSizeContentView`. Adds a `MenuBarExtra` status-bar icon (filled when recording) with Show/Hide overlay, Start/Stop, and Quit items. Captures `mainWindow` via `WindowAccessor` for the Show/Hide action. Installs `NSApplication.willTerminateNotification` hook to flush pending sentences on Cmd+Q. Runs `CrashRecovery.recoverPendingSessions()` detached at launch. |
 | `TranscriptView.swift` | The whole UI. No language pickers — compile-time constant. Shows `"\(ModelConfig.sourceLanguage) → \(ModelConfig.targetLanguage)"` label. Hosts `.translationTask` (the only way to get a `TranslationSession`), parks the closure via `AsyncStream<Never>` to hold the session alive. `displayRows` merges `sentences + inflightChunks` into `[DisplayRow]` keyed by UUID for flicker-free graduation. `TranscriptRow` handles all `DisplayRow` states. `StreamShareView` popover shows URL + QR code. |
 | `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns `sentences`, `inflightChunks`, `translationCache`, `partialTranslationTimers`, `ttsSpeaker`, `liveAudioServer`, `ttsActive`, `ttsListenerCount`, `ttsModelLoaded`. Wires `onChunkLifecycle` in `init`. No persisted settings (language is compile-time). No source/target pickers. `applyLifecycle` is the state machine for all chunk events. |
 | `SourcePipeline.swift` | Per-stream pipeline. Owns `AudioRecorder`. Runs `runRecordingLoop` + `runRecognitionCycle` as concurrent async-let children. The `SessionSnapshot` stream from `transcribe()` is drained but ignored — lifecycle callbacks drive everything. |
@@ -595,15 +595,17 @@ Persist grants across rebuilds: set `LIVETRANSLATE_SIGN_IDENTITY` to a self-sign
 cert name. TCC keys on the certificate identity rather than the binary hash, so
 future builds reuse the grant.
 
-### Window
+### Window and menu-bar icon
 
-- Real macOS app (`LSUIElement` not set / `false`). Not menu-bar only.
-- `NSWindow.level = .floating`, `isMovableByWindowBackground = true`,
-  `collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]`.
-- Traffic lights hidden (`standardWindowButton(.closeButton)?.isHidden = true` etc.).
-  Use Cmd+Q or the app menu to quit.
+- Real macOS app (`LSUIElement` not set / `false`). Has both a Dock icon and a status-bar icon.
+- `NSWindow.level = .statusBar` (level 25) — sits above Mission Control full-screen app content. `.floating` (level 3) is not sufficient for full-screen Spaces. The status-bar level still renders below the system menu bar itself during normal use.
+- `collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]` — appears on every Space including full-screen app Spaces.
+- `isMovableByWindowBackground = true` — drag from anywhere in the window.
+- Traffic lights hidden. Use Cmd+Q or the status-bar menu to quit.
+- `MenuBarExtra` scene: icon is `waveform.circle` at rest, `waveform.circle.fill` while recording. Menu items: Show/Hide overlay (Cmd+Shift+L), Start/Stop, Quit.
+- Show/Hide uses `orderFrontRegardless()` (not `makeKeyAndOrderFront`) so bringing the overlay back does not steal focus from a full-screen app — the whole point of the overlay is to be non-intrusive.
+- `mainWindow: NSWindow?` is captured via `WindowAccessor` into an App-level `@State` so the menu-bar Show/Hide button can order the window without searching `NSApp.windows`.
 - Compact mode: `@AppStorage("compactMode")` — hides the full bar, shows a slim bar.
-- No in-window Quit / Copy / Clear buttons.
 
 ---
 
