@@ -35,9 +35,32 @@ let tintedSymbol = NSImage(size: symbolBase.size, flipped: false) { rect in
     return true
 }
 
-// 2. Compose the full icon onto an NSImage.
-let icon = NSImage(size: NSSize(width: canvasSize, height: canvasSize))
-icon.lockFocus()
+// 2. Compose the full icon into an NSBitmapImageRep at exact pixel size.
+//    `NSImage.lockFocus()` honors display scale — on retina that yields a
+//    2048×2048 buffer and iconutil silently drops the @2x master because
+//    it's the wrong dimensions for `icon_512x512@2x.png`, producing an
+//    icns without the `ic10` type. Drawing into a bitmap rep with
+//    explicit pixelsWide/pixelsHigh sidesteps the scale entirely.
+let pixels = Int(canvasSize)
+guard let rep = NSBitmapImageRep(
+    bitmapDataPlanes: nil,
+    pixelsWide: pixels,
+    pixelsHigh: pixels,
+    bitsPerSample: 8,
+    samplesPerPixel: 4,
+    hasAlpha: true,
+    isPlanar: false,
+    colorSpaceName: .deviceRGB,
+    bytesPerRow: 0,
+    bitsPerPixel: 0
+) else {
+    FileHandle.standardError.write(Data("Failed to allocate bitmap rep\n".utf8))
+    exit(1)
+}
+rep.size = NSSize(width: canvasSize, height: canvasSize)
+
+NSGraphicsContext.saveGraphicsState()
+NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
 let cg = NSGraphicsContext.current!.cgContext
 
 let canvas = CGRect(x: 0, y: 0, width: canvasSize, height: canvasSize)
@@ -62,12 +85,10 @@ let symRect = CGRect(
     height: tintedSymbol.size.height
 )
 tintedSymbol.draw(in: symRect)
-icon.unlockFocus()
+NSGraphicsContext.restoreGraphicsState()
 
 // 3. PNG encode.
-guard let tiff = icon.tiffRepresentation,
-      let rep = NSBitmapImageRep(data: tiff),
-      let png = rep.representation(using: .png, properties: [:]) else {
+guard let png = rep.representation(using: .png, properties: [:]) else {
     FileHandle.standardError.write(Data("Failed to encode PNG\n".utf8))
     exit(1)
 }
