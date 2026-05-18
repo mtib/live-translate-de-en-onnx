@@ -8,65 +8,33 @@
 
 ---
 
-## ┌─────────────────────────────────────────────────────────────┐
-## │  RULE 1 — Update this file in the same commit as any        │
-## │           meaningful code change                            │
-## └─────────────────────────────────────────────────────────────┘
+## Rule 1: Update this file in the same commit as any meaningful code change
 
-"Meaningful change" means: any change to data flow, type shapes, lifecycle state
-machine, sentence-splitting logic, file layout, build steps, permissions, model
-paths, or key behaviors documented in this file.
+"Meaningful change" means: any change to data flow, type shapes, lifecycle state machine, sentence-splitting logic, file layout, build steps, permissions, model paths, or key behaviors documented in this file.
 
-This file is read by AI agents at the **start** of every session. Stale content
-causes agents to edit against a model that doesn't match the actual code — leading
-to incorrect diffs, missed invariants, and re-introduction of fixed bugs. The
-source comments say *what* a function does; CLAUDE.md says *why the design is
-shaped this way* and *what not to do again*.
+This file is read by AI agents at the **start** of every session. Stale content causes agents to edit against a model that doesn't match the actual code — leading to incorrect diffs, missed invariants, and re-introduction of fixed bugs. The source comments say *what* a function does; CLAUDE.md says *why the design is shaped this way* and *what not to do again*.
 
----
+## Rule 2: Persist learnings
 
-## ┌─────────────────────────────────────────────────────────────┐
-## │  RULE 2 — Persist learnings                                 │
-## └─────────────────────────────────────────────────────────────┘
+Every time a bug bites — a race, an actor-isolation surprise, a confused-by-the-API moment, a sherpa-onnx misuse — add a numbered entry to "Things that have bitten us already." Include: what went wrong, why it was hard to diagnose, and the shape of the fix. Do not remove old entries. The list is institutional memory.
 
-Every time a bug bites — a race, an actor-isolation surprise, a confused-by-the-API
-moment, a sherpa-onnx misuse — add a numbered entry to "Things that have bitten us
-already." Include: what went wrong, why it was hard to diagnose, and the shape of
-the fix. Do not remove old entries. The list is institutional memory.
+## Rule 3: Eagerly load Swift sources at session start
 
----
-
-## ┌─────────────────────────────────────────────────────────────┐
-## │  RULE 3 — Eagerly load Swift sources at session start       │
-## └─────────────────────────────────────────────────────────────┘
-
-Before editing any code, read **all** of `Sources/LiveTranslate/*.swift`. The data
-flow crosses many files and the interactions at the boundaries are subtle. In
-particular:
+Before editing any code, read **all** of `Sources/LiveTranslate/*.swift`. The data flow crosses many files and the interactions at the boundaries are subtle. In particular:
 
 - Lifecycle events flow from `SherpaTranscriber.onChunkLifecycle` → `Pipeline.applyLifecycle`
-- UUID continuity is a shared contract between `SherpaTranscriber`, `Pipeline`, and
-  `TranscriptView` — breaking it in any one place causes UI flicker
-- The crosstalk gate is applied in `DenoisingAudioSource` (after RNNoise, before
-  the broadcaster) so both recorder AND transcriber see the same muted buffer
+- UUID continuity is a shared contract between `SherpaTranscriber`, `Pipeline`, and `TranscriptView` — breaking it in any one place causes UI flicker
+- The crosstalk gate is applied in `DenoisingAudioSource` (after RNNoise, before the broadcaster) so both recorder AND transcriber see the same muted buffer
 
 Skimming or grepping for one symbol misses these patterns. Read everything, then edit.
 
----
-
-## ┌─────────────────────────────────────────────────────────────┐
-## │  RULE 4 — Always build with the signing identity            │
-## └─────────────────────────────────────────────────────────────┘
+## Rule 4: Always build with the signing identity
 
 ```sh
 LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev ./build.sh
 ```
 
-The user keeps `export LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev` in `~/.zshrc`.
-Non-interactive bash (the agent's Bash tool) does NOT source `.zshrc`. Without the
-variable every build is ad-hoc-signed, which produces a fresh `cdhash` and causes
-macOS TCC to re-prompt for mic + screen recording permission on every launch. Always
-set the env var explicitly in any build command the agent runs.
+The user keeps `export LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev` in `~/.zshrc`. Non-interactive bash (the agent's Bash tool) does NOT source `.zshrc`. Without the variable every build is ad-hoc-signed, which produces a fresh `cdhash` and causes macOS TCC to re-prompt for mic + screen recording permission on every launch. Always set the env var explicitly in any build command the agent runs.
 
 ---
 
@@ -159,32 +127,40 @@ missing and the app crashes on its first permission request.
 
 ## Architecture
 
-```
-Mic ──▶ DenoisingAudioSource(mic)  ──▶ SourcePipeline(mic)  ──┐
-          RNNoise + AGC + crosstalk       AudioRecorder           │  onChunkLifecycle callbacks
-          gate (mute if sys voiced)       (48 kHz Int16 WAV)      │
-                                                                  ├──▶ Pipeline.applyLifecycle  (@MainActor)
-System ─▶ DenoisingAudioSource(sys) ──▶ SourcePipeline(sys) ──┤        │
-          RNNoise + AGC                  AudioRecorder            │        │  .listening
-                                                                  │        │  .partial(text:)        → @Published inflightChunks
-                                                                  │        │  .completed(text:start:end:)  → translate → graduate
-                                                                  │        │  .dropped               → row removed
-                                                                  │        ▼
-Both streams share one SherpaTranscriber (recognizer loaded once) │  @Published sentences
-  Each transcribe() call creates its own sherpa-onnx ASR stream   │        │
-  Silero VAD per stream (created per transcribe() call)           │        ├──▶ TranscriptArchive (.jsonl, source-tagged)
-  Accumulator + Worker child tasks per stream                     │        ├──▶ MergedSubtitleArchive (per-language SRT)
-                                                                  │        └──▶ LiveAudioServer.publishTranscript (SSE)
-                                                                  │
-                                                                  │  on graduate with translation, ttsListenerCount > 0:
-                                                                  └──▶ OnnxTTSSpeaker.enqueue(translation)
-                                                                            │
-                                                                            ▼ 24 kHz PCM16 LE
-                                                                       LiveAudioServer.append(pcm)
-                                                                            │
-                                                                     /live.wav  (open-ended WAV stream)
-                                                                     /events    (SSE transcript)
-                                                                     /          (HTML listen page)
+```mermaid
+flowchart TD
+    Mic[Mic] --> DenMic["DenoisingAudioSource mic\nRNNoise + AGC + crosstalk gate"]
+    DenMic --> RecMic["AudioRecorder → .mic.wav\n48 kHz Int16"]
+    DenMic --> TMic["transcribe() — own ASR stream + Silero VAD\naccumulator + worker tasks"]
+
+    Sys[System] --> DenSys["DenoisingAudioSource system\nRNNoise + AGC"]
+    DenSys --> RecSys["AudioRecorder → .system.wav\n48 kHz Int16"]
+    DenSys --> TSys["transcribe() — own ASR stream + Silero VAD\naccumulator + worker tasks"]
+
+    subgraph Transcriber["SherpaTranscriber — recognizer loaded once, streams are cheap"]
+        TMic
+        TSys
+    end
+
+    TMic -->|onChunkLifecycle| Pipe["Pipeline.applyLifecycle\n@MainActor"]
+    TSys -->|onChunkLifecycle| Pipe
+
+    Pipe --> EL[".listening — reserve row"]
+    Pipe --> EP[".partial text — update inflight row"]
+    Pipe --> EC[".completed text start end — translate — graduate()"]
+    Pipe --> ED[".dropped — remove row"]
+
+    EC --> UI["@Published sentences + inflightChunks\nDisplayRow enum — UUID continuity"]
+    EC --> JSONL["TranscriptArchive .jsonl source-tagged"]
+    EC --> SRT["MergedSubtitleArchive .srt per language"]
+    EC --> Server["LiveAudioServer.publishTranscript\nport 8765"]
+    EC -->|"audioListenerCount > 0"| TTS["OnnxTTSSpeaker.enqueue\nkitten-mini ONNX → 24 kHz PCM16 LE"]
+
+    TTS -->|PCM audio| Server
+
+    Server --> R1["/ — HTML listen page"]
+    Server --> R2["/live.wav — open WAV stream"]
+    Server --> R3["/events — SSE transcript"]
 ```
 
 ---
@@ -486,14 +462,24 @@ the final one is fetched.
 
 ### UUID continuity through graduation
 
-```
-SherpaTranscriber fires:        Pipeline maintains:          TranscriptView sees:
-  .listening(id: X)     →       inflightChunks += [X, .listening]   → row X: "listening"
-  .partial(id: X, "Hallo") →    inflightChunks[X].state = .partial  → row X: "Hallo"
-  .completed(id: X, ...) →      Task { translate }
-                                 graduate(id: X, ...)
-                                   sentences += Sentence(id: X, ...)
-                                   inflightChunks -= X               → row X: "Hello" (same UUID)
+```mermaid
+sequenceDiagram
+    participant T as SherpaTranscriber
+    participant P as Pipeline
+    participant V as TranscriptView
+
+    T->>P: .listening(id: X)
+    P->>V: inflightChunks += [X, .listening]
+    Note over V: row X: "listening"
+
+    T->>P: .partial(id: X, "Hallo")
+    P->>V: inflightChunks[X].state = .partial("Hallo")
+    Note over V: row X: "Hallo"
+
+    T->>P: .completed(id: X, ...)
+    P->>P: Task { translate } → graduate(id: X, ...)
+    P->>V: sentences += Sentence(id: X, ...)<br/>inflightChunks -= X
+    Note over V: row X: "Hello" (same UUID — in-place update, no flicker)
 ```
 
 SwiftUI's `ForEach` on `displayRows` uses `.id` as the stable key. Because the UUID
