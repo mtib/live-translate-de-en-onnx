@@ -47,16 +47,23 @@ struct TranscriptView: View {
         // a dead band above our controls.
         .ignoresSafeArea()
         // Park the translation session for the lifetime of this config.
+        // SwiftUI cancels the closure on config change or view disappear;
+        // `defer` then clears the session before the next one is installed.
+        // We park by iterating an AsyncStream that's never written to —
+        // cancellation wakes the iterator. `Task.sleep` with anything
+        // close to Duration's range trips a precondition on macOS 15.
         .translationTask(translationConfig) { session in
             pipeline.installTranslationSession(session)
+            defer { pipeline.installTranslationSession(nil) }
             do {
                 try await session.prepareTranslation()
                 Log.line("Translation prepared")
             } catch {
                 Log.line("prepareTranslation failed: \(error.localizedDescription)")
             }
-            try? await Task.sleep(nanoseconds: .max)
-            pipeline.installTranslationSession(nil)
+            let (parked, holder) = AsyncStream<Never>.makeStream()
+            defer { holder.finish() }
+            for await _ in parked { }
         }
     }
 
