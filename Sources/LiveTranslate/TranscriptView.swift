@@ -222,39 +222,29 @@ struct TranscriptView: View {
 
     // MARK: - Sentence list
 
-    /// Auto-scrolling list. Completed sentences first, then in-flight
-    /// chunks at the bottom (each showing its current state with the
-    /// source icon prefix). Rows fade/slide in with `.transition` and
-    /// the list animates on changes so additions / state flips /
-    /// removals all look smooth instead of popping.
+    /// Auto-scrolling list. Sentences and inflight chunks share one
+    /// `ForEach` keyed on UUID. When a chunk graduates, its UUID is
+    /// inherited by the new `Sentence` (see `Pipeline.graduate`), so
+    /// SwiftUI sees an in-place content update on the same row — no
+    /// remove+insert, no flicker. `.transition(.opacity)` still fires
+    /// for real adds (new chunk) and real removes (pruned sentence).
     private func sentenceList(compact: Bool) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: compact ? 6 : 8) {
-                    ForEach(pipeline.sentences) { sentence in
-                        SentenceRow(sentence: sentence, compact: compact)
-                            .id(sentence.id)
-                            .transition(.opacity)
-                    }
-                    ForEach(pipeline.inflightChunks) { chunk in
-                        InflightRow(chunk: chunk, compact: compact)
-                            .id(chunk.id)
+                    ForEach(displayRows) { row in
+                        TranscriptRow(row: row, compact: compact)
+                            .id(row.id)
                             .transition(.opacity)
                     }
                     Color.clear.frame(height: 1).id("BOTTOM")
                 }
                 .padding(.vertical, 2)
-                .animation(.easeInOut(duration: 0.18), value: pipeline.sentences.map(\.id))
-                .animation(.easeInOut(duration: 0.18), value: pipeline.inflightChunks)
+                .animation(.easeInOut(duration: 0.18), value: displayRows.map(\.id))
             }
             .frame(minHeight: compact ? 50 : 140)
             .scrollIndicators(.hidden)
-            .onChange(of: pipeline.sentences.last?.id) { _, _ in
-                withAnimation(.easeOut(duration: 0.12)) {
-                    proxy.scrollTo("BOTTOM", anchor: .bottom)
-                }
-            }
-            .onChange(of: pipeline.inflightChunks.last?.id) { _, _ in
+            .onChange(of: displayRows.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.12)) {
                     proxy.scrollTo("BOTTOM", anchor: .bottom)
                 }
@@ -266,64 +256,60 @@ struct TranscriptView: View {
             }
         }
     }
+
+    /// Sentences (top) followed by in-flight chunks (bottom), in one
+    /// list so a graduating row keeps its identity across the swap.
+    private var displayRows: [DisplayRow] {
+        pipeline.sentences.map(DisplayRow.sentence)
+            + pipeline.inflightChunks.map(DisplayRow.inflight)
+    }
 }
 
-/// One completed-sentence row. Source icon (mic/speaker) on the left
-/// keeps the layout aligned with in-flight rows; translation is the
-/// primary line; source-text caption sits beneath it in full mode.
-/// No tints — everything uses standard text colors.
-private struct SentenceRow: View {
-    let sentence: Sentence
-    let compact: Bool
+/// One entry in the unified transcript list. Both variants carry the
+/// same UUID across graduation, so SwiftUI's diffing sees an in-place
+/// content update rather than a remove + insert.
+private enum DisplayRow: Identifiable, Equatable {
+    case sentence(Sentence)
+    case inflight(InflightChunk)
 
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: sentence.source.iconSystemName)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
-                .frame(width: 14, alignment: .center)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(sentence.translation.isEmpty ? sentence.text : sentence.translation)
-                    .font(compact ? .callout : .body)
-                    .foregroundStyle(.primary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                if !compact, !sentence.translation.isEmpty {
-                    Text(sentence.text)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                }
-            }
+    var id: UUID {
+        switch self {
+        case .sentence(let s):  return s.id
+        case .inflight(let c):  return c.id
         }
     }
 }
 
-/// In-flight chunk row. Three visual states:
-///   `.listening`              → italic secondary "listening" placeholder
-///   `.partial(text, nil)`     → italic secondary raw ASR text (no translation yet)
-///   `.partial(text, transl)`  → **same style as SentenceRow**: primary translation,
-///                               secondary caption with source text
-///   `.translating(text)`      → italic secondary "translating" + source caption
+/// One completed-sentence row. Source icon (mic/speaker) on the left
+/// keeps the layout aligned with in-flight rows; translation is the
+/// One row in the transcript list. Renders either a graduated
+/// `Sentence` or an in-flight chunk; using a single view type means
+/// SwiftUI keeps the underlying view instance when a chunk's UUID
+/// transitions from `.inflight(...)` to `.sentence(...)` — content
+/// updates in place, no fade-out/fade-in flicker.
 ///
-/// Using SentenceRow styling as soon as a translation is available means the
-/// row looks identical to its graduated form — the swap animation is invisible.
-private struct InflightRow: View {
-    let chunk: InflightChunk
+/// Visual states:
+///   `.listening`                    → italic "listening" placeholder
+///   `.partial(text, nil)`           → italic raw ASR text (no translation yet)
+///   `.partial(text, translation)`   → primary translation + secondary caption
+///   `.translating(text)`            → italic "translating" + caption
+///   `.sentence`                     → identical layout to `.partial(text, translation)`
+///                                      so the graduation swap is invisible.
+private struct TranscriptRow: View {
+    let row: DisplayRow
     let compact: Bool
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: chunk.source.iconSystemName)
+            Image(systemName: source.iconSystemName)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: 14, alignment: .center)
             VStack(alignment: .leading, spacing: 1) {
                 Text(primaryText)
                     .font(compact ? .callout : .body)
-                    .italic(isStateWord)
-                    .foregroundStyle(isStateWord ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+                    .italic(isPlaceholder)
+                    .foregroundStyle(isPlaceholder ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
                 if !compact, let cap = captionText {
@@ -337,27 +323,50 @@ private struct InflightRow: View {
         }
     }
 
-    /// True when `primaryText` is a placeholder word, not real content.
-    private var isStateWord: Bool {
-        switch chunk.state {
-        case .partial(_, let translation): return translation == nil
-        default: return true
+    private var source: SourceTag {
+        switch row {
+        case .sentence(let s):  return s.source
+        case .inflight(let c):  return c.source
+        }
+    }
+
+    /// True when `primaryText` is a placeholder word ("listening",
+    /// "translating", or a raw partial hypothesis with no translation
+    /// yet) — render italic + secondary so it reads as transient.
+    private var isPlaceholder: Bool {
+        switch row {
+        case .sentence:                             return false
+        case .inflight(let c):
+            switch c.state {
+            case .partial(_, let translation):      return translation == nil
+            default:                                return true
+            }
         }
     }
 
     private var primaryText: String {
-        switch chunk.state {
-        case .listening:                              return "listening"
-        case .partial(let text, let translation):    return translation ?? text
-        case .translating:                            return "translating"
+        switch row {
+        case .sentence(let s):
+            return s.translation.isEmpty ? s.text : s.translation
+        case .inflight(let c):
+            switch c.state {
+            case .listening:                            return "listening"
+            case .partial(let text, let translation):  return translation ?? text
+            case .translating:                          return "translating"
+            }
         }
     }
 
     private var captionText: String? {
-        switch chunk.state {
-        case .partial(let text, let translation):    return translation != nil ? text : nil
-        case .translating(let text):                 return text
-        default:                                     return nil
+        switch row {
+        case .sentence(let s):
+            return s.translation.isEmpty ? nil : s.text
+        case .inflight(let c):
+            switch c.state {
+            case .partial(let text, let translation):   return translation != nil ? text : nil
+            case .translating(let text):                return text
+            default:                                    return nil
+            }
         }
     }
 }

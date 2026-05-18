@@ -268,18 +268,20 @@ final class Pipeline: ObservableObject {
         }
     }
 
-    /// Turn an inflight chunk into a `Sentence`. The Sentence gets a
-    /// **fresh** UUID — reusing the chunk's UUID would collide with
-    /// the inflight row's `.id()` in SwiftUI's LazyVStack and break
-    /// the row swap. The sentence is also archived immediately to
-    /// JSONL + per-source SRT + merged SRT(s) so the work-dir files
-    /// stay live throughout the session (not just at end).
+    /// Turn an inflight chunk into a `Sentence`. The Sentence reuses
+    /// the chunk's UUID — the UI presents inflight rows and sentences
+    /// as a single merged ForEach (see `TranscriptView.sentenceList`),
+    /// so identity continuity here means SwiftUI sees a same-row
+    /// content swap instead of remove+insert, eliminating the
+    /// graduation flicker. The sentence is also archived immediately
+    /// to JSONL + per-source SRT + merged SRT(s) so the work-dir
+    /// files stay live throughout the session (not just at end).
     private func graduate(
         id: UUID, source: SourceTag, text: String, translation: String,
         createdAt: Date, endsAt: Date
     ) {
         let sentence = Sentence(
-            id: UUID(), text: text, translation: translation, source: source,
+            id: id, text: text, translation: translation, source: source,
             createdAt: createdAt, endsAt: endsAt, lastModified: Date()
         )
         sentences.append(sentence)

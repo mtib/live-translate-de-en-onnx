@@ -61,11 +61,10 @@ enum SourceTag: String, Codable, Hashable, Sendable, CaseIterable {
 /// listening → transcribing → translating → done lifecycle.
 ///
 /// `id` is generated at voice onset and remains stable through the
-/// whole pipeline. When the chunk graduates (translation done, or
-/// translation not needed), `Pipeline` builds a `Sentence` with a
-/// *fresh* UUID and removes this entry — SwiftUI sees that as one
-/// row being replaced by another in the same list position, which
-/// animates smoothly.
+/// whole pipeline. When the chunk graduates, `Pipeline` builds a
+/// `Sentence` with the **same** UUID — the merged ForEach in
+/// `TranscriptView` treats the cross-state swap as an in-place
+/// content update on the same row identity (no flicker).
 struct InflightChunk: Identifiable, Equatable {
     let id: UUID
     let source: SourceTag
