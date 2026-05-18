@@ -692,15 +692,33 @@ final class Pipeline: ObservableObject {
             return
         }
 
+        // Treat session start as the initial boundary so the 60 s timer
+        // starts counting from now, not from the epoch.
+        lastSummaryAt = Date()
+
         let summarizer = TopicSummarizer()
 
         summaryLoopTask = Task.detached(priority: .background) { [weak self] in
-            // Wait 15 s before the first attempt so the user has said something.
-            try? await Task.sleep(for: .seconds(15))
-
+            // Poll every 5 s and run when either trigger condition is met:
+            //   • 10+ new sentences (run immediately regardless of time), or
+            //   • 60 s elapsed since last summary AND 5+ new sentences.
+            // After a cycle completes, loop back without sleeping so that if
+            // conditions are already met again we run immediately.
             while !Task.isCancelled {
-                await self?.runOneSummaryCycle(summarizer: summarizer)
-                try? await Task.sleep(for: .seconds(60))
+                let shouldRun = await MainActor.run { [weak self] () -> Bool in
+                    guard let self else { return false }
+                    let boundary = self.lastSummaryAt ?? Date()
+                    let newCount = self.sentences.filter { $0.createdAt >= boundary }.count
+                    let secondsSince = -boundary.timeIntervalSinceNow
+                    return newCount >= 10 || (secondsSince >= 60 && newCount >= 5)
+                }
+
+                if shouldRun {
+                    await self?.runOneSummaryCycle(summarizer: summarizer)
+                    continue  // check again immediately before sleeping
+                }
+
+                try? await Task.sleep(for: .seconds(5))
             }
         }
         Log.line("TopicSummarizer: summary loop started")
