@@ -29,7 +29,15 @@ final class SherpaTranscriber: Transcriber {
     // MARK: — Tunables
 
     /// Trailing-silence endpoint threshold fed to sherpa-onnx rule 1.
-    static let endpointSilenceSeconds: Float = 1.0
+    /// Trailing silence after voiced speech that fires the ASR's
+    /// rule-1 endpoint (sherpa-onnx commits the hypothesis and closes
+    /// the chunk). Was 1.0 s, but natural mid-sentence pauses (breath,
+    /// thinking) routinely exceed 1 s — e.g. "Wenn das passiert ist,
+    /// wird *<breath>* der Quark…" got cut into two chunks. 1.8 s
+    /// gives normal breaths headroom while still committing within
+    /// ~2 s of a real sentence end. Rule-2 (max silence regardless)
+    /// stays at 2.4 s so long pauses still terminate.
+    static let endpointSilenceSeconds: Float = 1.8
 
     /// RMS used for the crosstalk gate.
     static let silenceRMSThreshold: Float = 0.012
@@ -41,7 +49,10 @@ final class SherpaTranscriber: Transcriber {
     /// Detected in the accumulator at each new voiced onset: if silence since
     /// the last voiced segment is ≥ this threshold the current hypothesis is
     /// force-completed and a fresh chunk begins — no word-distribution needed.
-    private static let vadSplitGapSamples: Int = Int(0.8 * 16_000)
+    /// Kept in sync with `endpointSilenceSeconds`: anything shorter would
+    /// pre-empt sherpa's own endpoint and split mid-word on natural breaths
+    /// (e.g. "Das Kä-<breath>-selab" → "Das Kä" / "selab …").
+    private static let vadSplitGapSamples: Int = Int(1.8 * 16_000)
 
     /// Once the active partial exceeds this many characters the accumulator
     /// looks for a sentence-ending punctuation boundary (`. `, `? `, `! `)
