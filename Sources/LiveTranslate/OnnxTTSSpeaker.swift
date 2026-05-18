@@ -37,6 +37,8 @@ final class OnnxTTSSpeaker: @unchecked Sendable {
 
     private var tts: OpaquePointer?
     private var sampleRate: Int32 = 24_000
+    private var loadAttempted: Bool = false
+    private var loadFailed: Bool = false
 
     // MARK: — Init
 
@@ -44,10 +46,9 @@ final class OnnxTTSSpeaker: @unchecked Sendable {
          onActivityChanged: @escaping (Bool) -> Void = { _ in }) {
         self.onPCM = onPCM
         self.onActivityChanged = onActivityChanged
-
-        q.async { [weak self] in
-            self?.loadTTS()
-        }
+        // Don't load the model here — wait until the first `enqueue`
+        // call with a real client connected. Saves ~50 MB + ~1 s of
+        // setup when nobody ever opens the listen page this run.
     }
 
     deinit {
@@ -61,6 +62,11 @@ final class OnnxTTSSpeaker: @unchecked Sendable {
         guard !trimmed.isEmpty else { return }
         q.async { [weak self] in
             guard let self else { return }
+            if !loadAttempted {
+                loadAttempted = true
+                loadTTS()
+            }
+            if loadFailed { return }
             pending.append(trimmed)
             if pending.count > maxQueue {
                 let drop = pending.count - maxQueue
@@ -114,12 +120,13 @@ final class OnnxTTSSpeaker: @unchecked Sendable {
             }
         }) else {
             Log.line("OnnxTTSSpeaker: SherpaOnnxCreateOfflineTts failed — check model bundle")
+            loadFailed = true
             return
         }
 
         tts = t
         sampleRate = SherpaOnnxOfflineTtsSampleRate(t)
-        Log.line("OnnxTTSSpeaker: kitten-mini loaded, sampleRate=\(sampleRate) Hz")
+        Log.line("OnnxTTSSpeaker: kitten-mini loaded on-demand, sampleRate=\(sampleRate) Hz")
     }
 
     private func pumpLocked() {

@@ -55,6 +55,15 @@ final class LiveAudioServer: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// How many clients are currently connected to `/live.wav`. Lets
+    /// the pipeline skip TTS synthesis (and the speaker lazy-load the
+    /// model) when there's nobody to listen.
+    var audioListenerCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return audioSubscribers.count
+    }
+
     init(port: UInt16) {
         self.port = port
     }

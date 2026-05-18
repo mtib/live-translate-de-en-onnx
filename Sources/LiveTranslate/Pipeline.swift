@@ -298,11 +298,15 @@ final class Pipeline: ObservableObject {
         inflightChunks.removeAll { $0.id == id }
         partialTranslationTimers.removeValue(forKey: id)
         recordSentence(sentence)
-        // Feed the translation into the live audio stream. The
-        // speaker is nil when no voice is installed for the target
-        // (or src == tgt, set up in `run()`), so this is a cheap
-        // no-op in those cases.
-        if !translation.isEmpty {
+        // Feed the translation into the live audio stream — but only
+        // if someone's actually listening. With zero subscribers on
+        // /live.wav the speaker would synthesize into the void; gating
+        // here skips the synthesis and (combined with `OnnxTTSSpeaker`'s
+        // lazy load) keeps the model entirely unloaded while no one
+        // has ever connected this run.
+        if !translation.isEmpty,
+           let server = liveAudioServer,
+           server.audioListenerCount > 0 {
             ttsSpeaker?.enqueue(translation)
         }
         enforceMaxCount()
