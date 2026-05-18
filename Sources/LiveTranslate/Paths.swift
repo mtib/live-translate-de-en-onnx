@@ -62,8 +62,8 @@ enum Paths {
         }
 
         /// `<workDir>/<stamp>.<lang>.srt` — live-merged SRT for one
-        /// language, both sources interleaved with `[Mic]` / `[Sys]`
-        /// prefixes. Intermediate only; embedded in the MKV.
+        /// language, both sources interleaved (no source prefix).
+        /// Intermediate only; embedded in the MKV.
         func mergedSubtitle(_ langCode: String) -> URL {
             workDir.appendingPathComponent("\(timestamp).\(langCode).srt")
         }

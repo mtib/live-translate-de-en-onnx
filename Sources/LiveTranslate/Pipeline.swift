@@ -297,18 +297,17 @@ final class Pipeline: ObservableObject {
     }
 
     /// Write a freshly-graduated sentence to disk: shared JSONL +
-    /// per-language merged SRTs (with `[Mic]` / `[Sys]` prefix).
-    /// All writes are queue-backed so this returns immediately.
+    /// per-language merged SRTs. All writes are queue-backed so this
+    /// returns immediately.
     private func recordSentence(_ s: Sentence) {
         archive?.append(s)
-        let prefix = "[\(s.source.shortLabel)]"
         let start = s.createdAt.timeIntervalSince(runStartedAt)
         let end = max(start, s.endsAt.timeIntervalSince(runStartedAt))
         let srcLang = String(source.identifier.prefix(2))
-        mergedSubtitles[srcLang]?.add(text: s.text, prefix: prefix, startSeconds: start, endSeconds: end)
+        mergedSubtitles[srcLang]?.add(text: s.text, startSeconds: start, endSeconds: end)
         let tgtLang = target.code
         if tgtLang != srcLang, !s.translation.isEmpty {
-            mergedSubtitles[tgtLang]?.add(text: s.translation, prefix: prefix, startSeconds: start, endSeconds: end)
+            mergedSubtitles[tgtLang]?.add(text: s.translation, startSeconds: start, endSeconds: end)
         }
     }
 
