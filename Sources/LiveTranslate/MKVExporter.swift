@@ -48,7 +48,26 @@ enum MKVExporter {
         let micDur = haveMic ? duration(of: micWAV) : 0
         let sysDur = haveSys ? duration(of: sysWAV) : 0
         let videoDuration = max(micDur, sysDur, 0.5)
+
+        // Optional screen-recording segments. A session may have zero
+        // or more — start/stop/change-target each closes a segment
+        // and (where applicable) opens the next. We probe each .mov
+        // for its actual duration so the composer knows how long to
+        // overlay it for. Invalid (zero-duration / probe failed)
+        // segments are skipped.
+        var segments: [(url: URL, offset: Double, duration: Double)] = []
+        for seg in outputs.screenSegments() {
+            let off = readScreenOffset(seg.offset)
+            let dur = await Self.movDuration(of: seg.mov)
+            if dur > 0.05 {
+                segments.append((seg.mov, off, dur))
+            } else {
+                Log.line("MKVExporter: skipping segment \(seg.mov.lastPathComponent) (duration=\(dur))")
+            }
+        }
+
         let args = buildArgs(
+            segments: segments,
             micWAV: haveMic ? micWAV : nil,
             sysWAV: haveSys ? sysWAV : nil,
             srts: srtFiles,
@@ -67,27 +86,23 @@ enum MKVExporter {
     // MARK: - ffmpeg argv
 
     private static func buildArgs(
+        segments: [(url: URL, offset: Double, duration: Double)],
         micWAV: URL?, sysWAV: URL?, srts: [(URL, String)], output: URL,
         videoDuration: Double
     ) -> [String] {
-        // `-t` before `-i` bounds the lavfi color generator to the
-        // audio's length. Combined with no `-shortest` further down,
-        // the output runs as long as the longest audio input and
-        // isn't trimmed to the last subtitle cue.
-        // Framerate is `r=10`: low enough to keep file size trivial,
-        // high enough that x264 produces a well-formed stream with
-        // proper `pix_fmt` / SPS-PPS that VLC will render. The
-        // earlier `r=2` plus `-tune stillimage` produced an
-        // essentially-empty stream (`pix_fmt=unknown`, junk
-        // framerate metadata).
-        var args: [String] = [
-            "-y",
-            "-loglevel", "warning",
-            "-f", "lavfi", "-t", String(format: "%.3f", videoDuration),
-            "-i", "color=c=black:s=640x360:r=10",
-        ]
+        // Input ordering: segment .mov files first (indices 0..S-1),
+        // then optional mic+system WAVs, then SRT files. The video
+        // composer runs in `-filter_complex` and emits `[vout]`; the
+        // audio mixer emits `[aout]`. Subtitle streams are mapped
+        // directly from their input indices.
+        var args: [String] = ["-y", "-loglevel", "warning"]
+
+        // Inputs in fixed order.
+        for seg in segments {
+            args.append(contentsOf: ["-i", seg.url.path])
+        }
         var audioInputs: [Int] = []
-        var nextIdx = 1
+        var nextIdx = segments.count
         if let m = micWAV {
             args.append(contentsOf: ["-i", m.path])
             audioInputs.append(nextIdx)
@@ -103,29 +118,86 @@ enum MKVExporter {
             args.append(contentsOf: ["-i", path.path])
             nextIdx += 1
         }
-        if audioInputs.count == 2 {
-            args.append(contentsOf: [
-                "-filter_complex",
-                "[\(audioInputs[0]):a][\(audioInputs[1]):a]amix=inputs=2:normalize=0[aout]"
-            ])
-        } else if audioInputs.count == 1 {
-            args.append(contentsOf: ["-filter_complex", "[\(audioInputs[0]):a]anull[aout]"])
+
+        // Build the single filter_complex graph: video composer
+        // (base canvas + per-segment scale-pad + overlays) and audio
+        // mixer.
+        var filterParts: [String] = []
+        let videoOutLabel: String
+
+        if segments.isEmpty {
+            // No segments → flat black canvas for the whole audio
+            // length. Matches today's behavior 1:1.
+            filterParts.append(
+                "color=c=black:s=1280x720:r=10:d=\(String(format: "%.3f", videoDuration))[vout]"
+            )
+            videoOutLabel = "[vout]"
+        } else {
+            // Base layer: black 1280×720 at 10 fps for the full
+            // audio duration. Per-segment streams are letterboxed
+            // (scale to fit + pad with black), PTS-shifted to their
+            // offset on the run timeline, then overlaid in order.
+            // `overlay=eof_action=pass` leaves the previous frame
+            // (or base black, between segments) when the overlay
+            // input has no current frame — that's how a 5 s clip
+            // starting at t=20 ends up showing black for [0,20)
+            // and [25,end) without trimming the output.
+            // `format=yuv420p` on the base ensures every overlay
+            // stage agrees on pixel format (libx264 wants yuv420p
+            // anyway).
+            filterParts.append(
+                "color=c=black:s=1280x720:r=10:d=\(String(format: "%.3f", videoDuration)),format=yuv420p[base]"
+            )
+            for (i, seg) in segments.enumerated() {
+                // Letterbox: keep aspect ratio, pad to 1280×720,
+                // center the content. Then shift PTS so the first
+                // frame of this segment lands at `offset` seconds
+                // on the composed timeline.
+                let offsetMs = String(format: "%.3f", max(0, seg.offset))
+                filterParts.append(
+                    "[\(i):v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setpts=PTS-STARTPTS+\(offsetMs)/TB,format=yuv420p[s\(i)]"
+                )
+            }
+            // Chain overlays: [base][s0]overlay→[v0]; [v0][s1]→[v1]; …
+            var prev = "[base]"
+            for i in 0..<segments.count {
+                let out = (i == segments.count - 1) ? "[vout]" : "[v\(i)]"
+                filterParts.append("\(prev)[s\(i)]overlay=eof_action=pass:shortest=0\(out)")
+                prev = out
+            }
+            videoOutLabel = "[vout]"
         }
-        args.append(contentsOf: ["-map", "0:v"])
+
+        // Audio chain into [aout].
+        if audioInputs.count == 2 {
+            filterParts.append(
+                "[\(audioInputs[0]):a][\(audioInputs[1]):a]amix=inputs=2:normalize=0[aout]"
+            )
+        } else if audioInputs.count == 1 {
+            filterParts.append("[\(audioInputs[0]):a]anull[aout]")
+        }
+
+        args.append(contentsOf: ["-filter_complex", filterParts.joined(separator: ";")])
+
+        // Maps. Video always comes from the filter graph now (even
+        // the no-segments path goes through filter so the rest of
+        // the command stays uniform).
+        args.append(contentsOf: ["-map", videoOutLabel])
         if !audioInputs.isEmpty {
             args.append(contentsOf: ["-map", "[aout]"])
         }
         for i in 0..<srts.count {
             args.append(contentsOf: ["-map", "\(firstSRTIdx + i)"])
         }
+
+        // Always re-encode video: filter_complex output isn't
+        // copyable. ultrafast keeps export quick; the composite is
+        // already low-fps low-bitrate so quality loss is moot.
         args.append(contentsOf: [
             "-c:v", "libx264",
             "-preset", "ultrafast",
-            // Drop `-tune stillimage` — combined with very low
-            // framerates it was producing a malformed H.264 stream
-            // (unknown pix_fmt, junk r_frame_rate metadata) that
-            // VLC refused to render.
             "-pix_fmt", "yuv420p",
+            "-r", "10",
             "-c:a", "aac",
             "-c:s", "srt",
         ])
@@ -154,12 +226,36 @@ enum MKVExporter {
         return args
     }
 
+    /// Parse the `<stamp>.screen.offset` sidecar — one decimal number
+    /// of seconds, written by `ScreenVideoRecorder` on its first
+    /// frame. Missing / malformed → 0 (treat as "first frame coincided
+    /// with run start"; safer than guessing).
+    private static func readScreenOffset(_ url: URL) -> Double {
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) else { return 0 }
+        return Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+    }
+
     /// AVFoundation-based WAV duration probe. `length / sampleRate` is
     /// exact for PCM and avoids the ffprobe round-trip.
     private static func duration(of url: URL) -> Double {
         guard let file = try? AVAudioFile(forReading: url) else { return 0 }
         let sr = file.processingFormat.sampleRate
         return sr > 0 ? Double(file.length) / sr : 0
+    }
+
+    /// AVURLAsset-based video duration probe. Returns 0 on failure
+    /// so a corrupt/zero-length segment .mov is simply skipped by
+    /// the composer rather than blowing up the whole export.
+    private static func movDuration(of url: URL) async -> Double {
+        let asset = AVURLAsset(url: url)
+        do {
+            let dur = try await asset.load(.duration)
+            let seconds = CMTimeGetSeconds(dur)
+            return seconds.isFinite ? seconds : 0
+        } catch {
+            return 0
+        }
     }
 
     private static func locateFFmpeg() -> String? {

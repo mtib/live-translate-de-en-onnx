@@ -104,6 +104,7 @@ struct TranscriptView: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
             Spacer(minLength: 4)
+            ScreenPickButton(pipeline: pipeline)
             streamShareButton
             iconButton("chevron.down", help: "Show controls") {
                 compactMode = false
@@ -127,6 +128,7 @@ struct TranscriptView: View {
                         .fill(.secondary.opacity(0.1))
                 )
             Spacer(minLength: 6)
+            ScreenPickButton(pipeline: pipeline)
             streamShareButton
             iconButton("chevron.up", help: "Compact view") {
                 compactMode = true

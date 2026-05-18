@@ -1,4 +1,5 @@
 import SwiftUI
+import ScreenCaptureKit
 
 /// Compact transcript UI shown inside the MenuBarExtra `.window` popover.
 /// Mirrors the compact bar layout from `TranscriptView` and reuses
@@ -44,6 +45,7 @@ struct MenuBarView: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
             Spacer(minLength: 4)
+            ScreenPickButton(pipeline: pipeline)
             streamShareButton
             overlayToggleButton
         }
