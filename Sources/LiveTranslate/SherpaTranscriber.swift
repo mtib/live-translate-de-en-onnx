@@ -236,14 +236,16 @@ final class SherpaTranscriber: Transcriber {
         defer { SherpaOnnxDestroyOnlineStream(stream) }
 
         // Turn-level bookkeeping.
-        var turnStartSample = 0
+        var turnStartSample = 0     // voice onset of the current ASR turn
+        var chunkStartSample = 0    // voice onset of the current *chunk* (advances after splits)
         var cumulativeSamples = 0
         var chunkIndex = 0
         var currentChunkID: UUID? = nil
         var hadVoice = false
 
         // Gap-split tracking: sample at which the last voiced segment ended,
-        // used to detect speaker-boundary silences at the next voiced onset.
+        // used to detect speaker-boundary silences at the next voiced onset
+        // and to produce accurate speech-end timestamps.
         var lastVoicedEndSample = 0
         var prevVoiced = false
 
@@ -295,6 +297,7 @@ final class SherpaTranscriber: Transcriber {
                     let id = UUID()
                     currentChunkID = id
                     turnStartSample = samplesBefore
+                    chunkStartSample = samplesBefore
                     chunkIndex += 1
                     Log.line("SherpaTranscriber[\(tag)]: voice onset #\(chunkIndex) (id=\(id.uuidString.prefix(8))) at \(String(format:"%.2f",Double(samplesBefore)/16_000))s")
                     onChunkLifecycle?(id, source, .listening)
@@ -321,7 +324,8 @@ final class SherpaTranscriber: Transcriber {
                             sink.yield(TurnRecord(
                                 chunkID: id, index: chunkIndex,
                                 text: splitRemainder,
-                                startSample: turnStartSample, endSample: samplesBefore
+                                startSample: chunkStartSample,
+                                endSample: lastVoicedEndSample  // when speech actually ended
                             ))
                         } else {
                             onChunkLifecycle?(id, source, .dropped)
@@ -329,7 +333,8 @@ final class SherpaTranscriber: Transcriber {
                         SherpaOnnxOnlineStreamReset(recognizer, stream)
                         committedLength = 0
                         lastPartialText = ""
-                        turnStartSample = samplesBefore
+                        turnStartSample = samplesBefore   // new turn starts at new voice onset
+                        chunkStartSample = samplesBefore  // new chunk starts at new voice onset
                         chunkIndex += 1
                         let newID = UUID()
                         currentChunkID = newID
@@ -374,7 +379,7 @@ final class SherpaTranscriber: Transcriber {
                         let remainder  = remStart < active.endIndex
                             ? String(active[remStart...]) : ""
 
-                        let startSec = Double(turnStartSample) / 16_000
+                        let startSec = Double(chunkStartSample) / 16_000
                         let endSec   = Double(cumulativeSamples) / 16_000
                         onChunkLifecycle?(id, source, .completed(
                             text: completed,
@@ -383,6 +388,8 @@ final class SherpaTranscriber: Transcriber {
 
                         // committedLength now covers completed + the space.
                         committedLength = clampedCommit + completed.count + 1
+                        // Next chunk starts where this one ended.
+                        chunkStartSample = cumulativeSamples
 
                         // Open a new inflight row for the remainder.
                         let newID = UUID()
@@ -429,18 +436,21 @@ final class SherpaTranscriber: Transcriber {
                     }
                     onChunkLifecycle?(currentChunkID ?? UUID(), source, .dropped)
                 } else {
+                    // End at last voiced sample, not end of silence buffer.
+                    let endSample = max(chunkStartSample, lastVoicedEndSample)
                     sink.yield(TurnRecord(
                         chunkID: currentChunkID ?? UUID(),
                         index: chunkIndex,
                         text: remainder.isEmpty ? fullText : remainder,
-                        startSample: turnStartSample,
-                        endSample: cumulativeSamples
+                        startSample: chunkStartSample,
+                        endSample: endSample
                     ))
                 }
 
                 SherpaOnnxOnlineStreamReset(recognizer, stream)
                 committedLength = 0
                 turnStartSample = cumulativeSamples
+                chunkStartSample = cumulativeSamples
                 currentChunkID = nil
                 hadVoice = false
                 prevVoiced = false
@@ -473,12 +483,13 @@ final class SherpaTranscriber: Transcriber {
                 }
                 onChunkLifecycle?(currentChunkID ?? UUID(), source, .dropped)
             } else {
+                let flushEnd = max(chunkStartSample, lastVoicedEndSample)
                 sink.yield(TurnRecord(
                     chunkID: currentChunkID ?? UUID(),
                     index: chunkIndex,
                     text: remainder.isEmpty ? fullText : remainder,
-                    startSample: turnStartSample,
-                    endSample: cumulativeSamples
+                    startSample: chunkStartSample,
+                    endSample: flushEnd > chunkStartSample ? flushEnd : cumulativeSamples
                 ))
             }
         }
