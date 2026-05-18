@@ -16,7 +16,13 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-15
+    # Needs Swift 6.2 (Package.swift `swift-tools-version:6.2`) and the
+    # macOS 26 SDK (`platforms: [.macOS(.v26)]`). The `macos-15` runner
+    # ships Swift 6.1 / Xcode 16, which fails at `swift build` with
+    # "package is using Swift tools version 6.2.0 but the installed
+    # version is 6.1.0". The `macos-26` GitHub-hosted runner ships
+    # Xcode 26 and Swift 6.2.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
