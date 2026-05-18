@@ -60,6 +60,10 @@ final class Pipeline: ObservableObject {
     /// QR code so a phone-with-headphones can listen along.
     @Published private(set) var liveStreamURL: String?
 
+    /// Rolling topic label + two-sentence summary produced by `TopicSummarizer`.
+    /// Nil when no session is active or Apple Intelligence is unavailable.
+    @Published var transcriptSummary: TranscriptSummary? = nil
+
     /// True while the TTS pipeline is doing real work — the model has
     /// finished its lazy load AND there's at least one listener
     /// connected to `/live.wav`. UI shows this as a green stream
@@ -108,6 +112,9 @@ final class Pipeline: ObservableObject {
     /// throttle partial translations to at most once per second so we
     /// don't flood the translator with every token emission.
     private var partialTranslationTimers: [UUID: Date] = [:]
+
+    private var summaryLoopTask: Task<Void, Never>? = nil
+    private var lastSummary: TranscriptSummary? = nil
 
     private var runTask: Task<Void, Never>?
     /// Shared JSONL archive — sentences from all sources interleave
@@ -379,6 +386,7 @@ final class Pipeline: ObservableObject {
     func clear() {
         sentences = []
         inflightChunks = []
+        stopSummaryLoop()
     }
 
     /// Load a canned set of mic/system sentences into the UI for
@@ -449,6 +457,7 @@ final class Pipeline: ObservableObject {
             ttsModelLoaded = false
             ttsListenerCount = 0
             recomputeTTSActive()
+            stopSummaryLoop()
             if restartRequested {
                 restartRequested = false
                 sentences = []
@@ -567,6 +576,7 @@ final class Pipeline: ObservableObject {
         }
 
         status = .running
+        startSummaryLoop()
 
         // 5. Background prune loop (the translation worker is gone —
         //    translation happens inline in the lifecycle handler).
@@ -669,6 +679,66 @@ final class Pipeline: ObservableObject {
             } else {
                 break
             }
+        }
+    }
+
+    // MARK: - Summary loop
+
+    private func startSummaryLoop() {
+        guard summaryLoopTask == nil else { return }
+        guard TopicSummarizer.isAvailable() else {
+            Log.line("TopicSummarizer: Apple Intelligence not available — skipping summary loop")
+            return
+        }
+
+        let summarizer = TopicSummarizer()
+
+        summaryLoopTask = Task.detached(priority: .background) { [weak self] in
+            // Wait 15 s before the first attempt so the user has said something.
+            try? await Task.sleep(for: .seconds(15))
+
+            while !Task.isCancelled {
+                await self?.runOneSummaryCycle(summarizer: summarizer)
+                try? await Task.sleep(for: .seconds(60))
+            }
+        }
+        Log.line("TopicSummarizer: summary loop started")
+    }
+
+    private func stopSummaryLoop() {
+        summaryLoopTask?.cancel()
+        summaryLoopTask = nil
+        lastSummary = nil
+        transcriptSummary = nil
+    }
+
+    private func runOneSummaryCycle(summarizer: TopicSummarizer) async {
+        let (recentTexts, previous): ([String], TranscriptSummary?) = await MainActor.run { [weak self] in
+            guard let self else { return ([], nil) }
+            let cutoff = Date().addingTimeInterval(-5 * 60)
+            let texts = self.sentences
+                .filter { $0.createdAt >= cutoff }
+                .map { s in s.translation.isEmpty ? s.text : s.translation }
+            return (texts, self.lastSummary)
+        }
+
+        guard recentTexts.count >= 3 else {
+            Log.line("TopicSummarizer: \(recentTexts.count) sentences — skipping (need ≥ 3)")
+            return
+        }
+
+        do {
+            let result = try await summarizer.summarize(
+                translations: recentTexts,
+                previous: previous
+            )
+            await MainActor.run { [weak self] in
+                self?.transcriptSummary = result
+                self?.lastSummary = result
+            }
+            Log.line("TopicSummarizer: topic=\(result.topic)")
+        } catch {
+            Log.line("TopicSummarizer error: \(error)")
         }
     }
 }
