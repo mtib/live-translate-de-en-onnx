@@ -897,3 +897,31 @@ tccutil reset ScreenCapture local.mtib.livetranslate
     `setpts=PTS-STARTPTS+<offset>/TB` in the filter graph so it lands at the right
     spot on the audio timeline. Forgetting any one of those three (PTS session start,
     offset sidecar, filter setpts) gives a video that drifts away from the SRT cues.
+
+38. **SCK stream silently dies ~44 s in on macOS 26 (`.macOS(.v26)` deployment target).**
+    When the deployment target was bumped from v15 to v26, macOS started stopping the
+    `SCStream` with `"Stream was stopped by the system"` (~44 s in). The SCStreamDelegate
+    method `didStopWithError` was previously a no-op log line, so the broadcaster was
+    never finished and the downstream pipeline drained. The `-3808` "already stopped"
+    error at pipeline shutdown was a symptom of this. Fix: in `didStopWithError`, check
+    `intentionalStop` (set in `stop()` before `stopCapture()`) to distinguish
+    system-initiated from user-initiated stops. On a system stop, spawn an
+    `attemptReconnect()` task that re-calls `start()` with exponential backoff (1 s →
+    2 s → 4 s → 8 s → 16 s). The broadcaster is deliberately NOT finished between
+    attempts — downstream for-await loops remain alive and resume receiving audio as
+    soon as capture restarts. `broadcaster.finishAll()` is called only if all five
+    attempts exhaust.
+
+39. **`ScreenVideoRecorder` did not auto-resume when macOS stopped its SCK stream.**
+    When the same macOS 26 SCK lifecycle event (lesson #38) also terminated the
+    `ScreenVideoRecorder`'s stream, `didStopWithError` only finalized the current
+    `.mov` segment — no new segment was opened. Symptom: screen recording stopped
+    mid-session whenever the system reset the stream, with no indication in the UI.
+    Fix: added `intentionalStop` flag (same pattern as `SystemAudioSource`) and an
+    `onSystemStop: (() -> Void)?` callback to `ScreenVideoRecorder`. `didStopWithError`
+    checks `intentionalStop` and, on a system stop, calls the callback after
+    `finalizeWriter()`. `Pipeline.openScreenSegment` wires the callback to nil out
+    `screenRecorder`/`isScreenRecording` and call `openScreenSegment` again, producing
+    a new segment that picks up immediately after the gap. The `intentionalStop` guard
+    prevents a reconnect loop when the user calls `stop()` (which also triggers
+    `stopCapture()` and may fire `didStopWithError`).

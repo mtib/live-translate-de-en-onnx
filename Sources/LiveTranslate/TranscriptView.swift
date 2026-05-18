@@ -77,7 +77,7 @@ struct TranscriptView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary != nil)
+            .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary?.summary)
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 fullBar
@@ -88,51 +88,74 @@ struct TranscriptView: View {
                 sentenceList(compact: false)
             }
             .padding(14)
-            .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary != nil)
+            .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary?.summary)
         }
     }
 
     // MARK: - Bars
 
-    /// Compact bar: primary action, language pair label, expand.
+    /// Compact bar: primary action, current topic (if any), icon row.
     /// In-flight activity is shown in the sentence list itself (one
     /// row per active chunk), so the bar stays minimal.
     private var compactBar: some View {
         HStack(spacing: 6) {
             primaryButton(compact: true)
-            Text("\(pipeline.source.identifier.prefix(2)) → \(pipeline.target.code)")
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.secondary)
+            if let topic = pipeline.transcriptSummary?.topic {
+                Text(topic)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             Spacer(minLength: 4)
+            aiToggleButton
             ScreenPickButton(pipeline: pipeline)
             streamShareButton
             iconButton("chevron.down", help: "Show controls") {
                 compactMode = false
             }
         }
+        .animation(.easeInOut(duration: 0.2), value: pipeline.transcriptSummary?.topic)
     }
 
-    /// Full bar: primary action, language pair label, compact toggle.
-    /// Language pair is a compile-time constant (ModelConfig.sourceLanguage →
-    /// ModelConfig.targetLanguage) — no runtime picker.
+    /// Full bar: primary action, current topic (if any), icon row.
     private var fullBar: some View {
         HStack(spacing: 10) {
             primaryButton(compact: false)
-            Text("\(ModelConfig.sourceLanguage) → \(ModelConfig.targetLanguage)")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(.secondary.opacity(0.1))
-                )
+            if let topic = pipeline.transcriptSummary?.topic {
+                Text(topic)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             Spacer(minLength: 6)
+            aiToggleButton
             ScreenPickButton(pipeline: pipeline)
             streamShareButton
             iconButton("chevron.up", help: "Compact view") {
                 compactMode = true
             }
+        }
+        .animation(.easeInOut(duration: 0.2), value: pipeline.transcriptSummary?.topic)
+    }
+
+    /// Sparkle toggle — only shown when Apple Intelligence is available.
+    /// Tinted accent when on, secondary when off.
+    @ViewBuilder
+    private var aiToggleButton: some View {
+        if pipeline.aiAnalysisAvailable {
+            Button {
+                pipeline.aiAnalysisEnabled.toggle()
+            } label: {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(
+                        pipeline.aiAnalysisEnabled
+                            ? Color.accentColor
+                            : Color.secondary
+                    )
+            }
+            .buttonStyle(.plain)
+            .help(pipeline.aiAnalysisEnabled ? "Disable AI analysis" : "Enable AI analysis")
         }
     }
 
@@ -172,20 +195,14 @@ struct TranscriptView: View {
     /// `transcriptSummary` is nil (i.e. before the first summary arrives).
     @ViewBuilder
     private var summaryBar: some View {
-        if let s = pipeline.transcriptSummary {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(s.topic)
-                    .font(.caption.bold())
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                Text(s.summary)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .transition(.opacity.combined(with: .move(edge: .top)))
+        if let s = pipeline.transcriptSummary, !s.summary.isEmpty {
+            Text(s.summary)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .transition(.opacity.combined(with: .move(edge: .top)))
         }
     }
 
