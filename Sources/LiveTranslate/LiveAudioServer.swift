@@ -604,10 +604,35 @@ final class LiveAudioServer: @unchecked Sendable {
       // the server replays the session so far on each new connection,
       // so a brief drop won't lose context. Renders only finalized
       // sentences — no partials, no flicker.
+      //
+      // DOM cap: at most MAX_ROWS rows are kept attached. Long sessions
+      // would otherwise grow unbounded — by hour 4 of a meeting that's
+      // a few thousand nodes, which is where mobile Safari starts to
+      // jank. Matches the server's replay cap so reconnect dedup still
+      // works (every event in the replay was seen on the live channel).
+      const MAX_ROWS = 200;
       const seen = new Set();
       function fmtTime(iso) {
         try { return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
         catch (e) { return ''; }
+      }
+      function trimRows(userIsNearBottom) {
+        while (list.children.length > MAX_ROWS) {
+          const oldest = list.firstElementChild;
+          if (!oldest) break;
+          const removedHeight = oldest.offsetHeight;
+          if (oldest.dataset && oldest.dataset.key) {
+            seen.delete(oldest.dataset.key);
+          }
+          list.removeChild(oldest);
+          // If the user is reading history (scrolled up), keep their
+          // viewport stable by shifting the scroll up by the height
+          // of the row we just removed. If they're at the live edge
+          // we let the bottom stay at the bottom.
+          if (!userIsNearBottom) {
+            window.scrollBy(0, -removedHeight);
+          }
+        }
       }
       function addRow(rec) {
         const key = (rec.start || '') + '|' + (rec.end || '') + '|' + (rec.transcription || '');
@@ -617,6 +642,7 @@ final class LiveAudioServer: @unchecked Sendable {
         if (empty) empty.remove();
         const row = document.createElement('div');
         row.className = 'row';
+        row.dataset.key = key;
         const t = document.createElement('div');
         t.className = 'translation';
         t.textContent = rec.translation || rec.transcription || '';
@@ -632,8 +658,8 @@ final class LiveAudioServer: @unchecked Sendable {
         m.textContent = fmtTime(rec.start) + ' · ' + (rec.source || '');
         row.appendChild(m);
         list.appendChild(row);
-        // Autoscroll only if the user is already near the bottom.
         const nearBottom = window.scrollY + window.innerHeight >= document.body.scrollHeight - 120;
+        trimRows(nearBottom);
         if (nearBottom) window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
       }
       function connectEvents() {
