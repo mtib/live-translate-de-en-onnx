@@ -142,17 +142,12 @@ chunks as reserved rows that flip through `.listening → .transcribing
   gating) and a sherpa-onnx streaming zipformer recognizer. When the
   recognizer fires its built-in endpoint (≥1 s trailing silence, rule 1),
   the committed text is read BEFORE resetting the stream.
-- **Per-segment speaker detection splits turns.** Within each endpoint-bounded
-  turn, the accumulator tracks individual voiced segments (each
-  contiguous run of voiced audio separated by VAD silence). The worker
-  runs campplus embedding on each segment (skipping segments < 0.1 s),
-  then groups consecutive same-speaker segments. If only one speaker
-  group, the turn emits as a single `.completed` chunk. If multiple
-  speakers, the text is split proportionally by voiced audio duration and
-  emitted as separate chunks — one per speaker group. **Speaker labels
-  are NOT shown in the UI**; the visual separation (separate rows) is
-  the cue. Additional groups beyond the first use a fresh UUID and
-  emit `.completed` directly (no prior `.listening` row).
+- **No speaker diarization.** Earlier iterations of this design wired
+  campplus into the worker for per-segment speaker embedding +
+  cosine-sim clustering. That path was never finished and is not
+  active. Mic and system are already on independent pipelines (with
+  their own SRTs), so within one source we treat all voiced audio as
+  one speaker.
 - **ONNX models: bundled only.** All models are copied into
   `Contents/Resources/` by `build.sh` (downloaded by
   `tools/download-sherpa.sh`). Language pair is a compile-time
@@ -258,8 +253,7 @@ chunks as reserved rows that flip through `.listening → .transcribing
 | `DenoisingAudioSource.swift` | Wraps any `AudioSource`, applies its own `RNNoiseProcessor`, re-broadcasts. One per input stream so denoiser state is independent. |
 | `RNNoiseProcessor.swift` | Swift wrapper around the vendored RNNoise C library. Owns the `DenoiseState`, buffers arbitrary-sized input into 480-sample frames, handles ±32768 ↔ ±1 scaling, emits denoised samples via `drain(into:count:)`. |
 | `CRNNoise/` | Vendored xiph/rnnoise v0.1.1 as a SwiftPM C target. BSD 3-clause; GRU weights statically linked. See `Sources/CRNNoise/README.md`. |
-| `SherpaTranscriber.swift` | **The transcriber.** Two structured-concurrency child tasks (accumulator + worker) per `transcribe()` call. Accumulator resamples 48→16 kHz, feeds Silero-VAD + sherpa-onnx streaming recognizer, fires endpoint events. Worker reads committed text, runs speaker embedding, emits `.completed([Speaker N] text)`. |
-| `SpeakerTracker.swift` | campplus speaker embedding extraction + cosine-sim clustering. One instance per audio stream; `label(for:)` synchronously returns "Speaker N". |
+| `SherpaTranscriber.swift` | **The transcriber.** Two structured-concurrency child tasks (accumulator + worker) per `transcribe()` call. Accumulator resamples 48→16 kHz, feeds Silero-VAD (for voice-onset detection only) + sherpa-onnx streaming recognizer, fires endpoint events. Worker reads committed text and emits `.completed(text)`. |
 | `ModelConfig.swift` | Compile-time constants: source/target language codes, ONNX model paths relative to `Contents/Resources/`. |
 | `CSherpaOnnx/` | SwiftPM C bridge target: `c-api.h` header + stub `.c` file. Linker flags point at `external/sherpa-onnx/lib/`. |
 | `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
@@ -277,9 +271,9 @@ chunks as reserved rows that flip through `.listening → .transcribing
 
 `SherpaTranscriber`'s accumulator feeds audio into the sherpa-onnx
 streaming recognizer continuously; when the recognizer fires an endpoint
-(≥1 s trailing silence) the committed hypothesis is read, labeled with
-a `[Speaker N]` prefix, and emitted as a single sentence. The Pipeline
-gets one `SessionSentence` per closed turn, which lands as one `Sentence`
+the committed hypothesis is read and emitted as a single sentence. The
+Pipeline gets one `SessionSentence` per closed turn, which lands as one
+`Sentence`
 row, which writes one JSONL line and one SRT cue.
 
 The transcriber owns sentence segmentation. The Pipeline never splits,
@@ -306,16 +300,14 @@ Backends that don't report timing pass `nil` for `startSeconds` /
 
 ### Concurrent accumulator + worker
 
-Speaker embedding takes a few hundred ms. If we ran it synchronously
-in the audio pump, audio would accumulate in the broadcaster unread
-during that time.
-
-The fix is two structured child tasks under one `async let`:
+The accumulator and worker run as two structured child tasks under one
+`async let` so post-endpoint work (text emission, lifecycle events)
+doesn't block the audio pump.
 
 - **Accumulator** reads audio forever, feeds the streaming recognizer,
   emits a `TurnRecord` (text + samples) on each endpoint.
-- **Worker** drains the `TurnRecord` queue, computes speaker embedding,
-  fires lifecycle events. Sees turns in order.
+- **Worker** drains the `TurnRecord` queue and fires lifecycle events
+  in turn order.
 
 The queue is unbounded; backpressure isn't a concern at our rates.
 
@@ -424,10 +416,8 @@ builds reuse the existing grant. See README for the one-time setup.
 - [ ] Per-app audio capture (instead of whole-machine) via SCK's filter
 - [x] RNNoise denoising on the merged stream (vendored, BSD 3-clause)
 - [x] sherpa-onnx streaming RNN-T (zipformer) replaces whisper.cpp
-- [x] Silero-VAD endpoint detection
-- [x] campplus speaker diarization (`[Speaker N]` labels)
+- [x] Silero-VAD voice-onset detection
 - [x] kitten-mini ONNX TTS replaces AVSpeechSynthesizer
-- [ ] Speaker name assignment / correction UI
 - [ ] OpenRouter fallback as an alternative `Translator` impl
 - [ ] Global hotkey to start/stop
 - [ ] Click-through floating overlay mode
