@@ -146,22 +146,17 @@ struct MenuBarView: View {
             // changes the ScrollView frame — safeAreaInset adjusts content
             // offset instead, keeping the bottom anchor stable.
             .safeAreaInset(edge: .top, spacing: 0) {
-                if let s = pipeline.transcriptSummary {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(s.topic)
-                            .font(.caption.bold())
-                            .lineLimit(1)
-                        Text(s.summary)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(3)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 4)
-                    .background(.regularMaterial)
-                    .transition(.opacity)
-                    .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary != nil)
+                if let s = pipeline.transcriptSummary, !s.summary.isEmpty {
+                    Text(s.summary)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 4)
+                        .background(.regularMaterial)
+                        .transition(.opacity)
+                        .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary?.summary)
                 }
             }
             .onChange(of: displayRows.last?.id) { _, _ in

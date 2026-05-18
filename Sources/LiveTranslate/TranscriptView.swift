@@ -191,20 +191,16 @@ struct TranscriptView: View {
     /// `transcriptSummary` is nil (i.e. before the first summary arrives).
     @ViewBuilder
     private var summaryBar: some View {
-        if let s = pipeline.transcriptSummary {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(s.topic)
-                    .font(.caption.bold())
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                Text(s.summary)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .transition(.opacity.combined(with: .move(edge: .top)))
+        if let s = pipeline.transcriptSummary, !s.summary.isEmpty {
+            Text(s.summary)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 4)
+                .background(Color(nsColor: .textBackgroundColor).opacity(0.85))
+                .transition(.opacity.combined(with: .move(edge: .top)))
         }
     }
 
@@ -313,10 +309,7 @@ struct TranscriptView: View {
             // bottom anchor stays put and there is no visible scroll jump.
             .safeAreaInset(edge: .top, spacing: 0) {
                 summaryBar
-                    .padding(.vertical, 4)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(nsColor: .textBackgroundColor).opacity(0.85))
-                    .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary != nil)
+                    .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary?.summary)
             }
             .onChange(of: displayRows.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.12)) {
