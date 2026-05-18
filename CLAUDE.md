@@ -644,6 +644,9 @@ future builds reuse the grant.
 - [x] Per-run temp dir → zip → `~/Documents/LiveTranslate/`
 - [x] CrashRecovery — finalize leftover work dirs on next launch
 - [x] On-device LLM topic+summary loop — Apple FoundationModels, every 60 s, shows topic label + 2-sentence summary in overlay and popover; gracefully skipped if Apple Intelligence unavailable
+- [x] Optional screen recording — multi-segment, start/stop/change-target
+  mid-session, composed onto a 1280×720 black canvas via ffmpeg
+  filter_complex (overlay chain, letterboxed, centered)
 - [ ] Speaker diarization — campplus embedding was scaffolded but never completed;
   currently not active anywhere in the codebase
 - [ ] Retargeting to other language pairs — change `ModelConfig.sourceLanguage /
@@ -860,3 +863,37 @@ tccutil reset ScreenCapture local.mtib.livetranslate
     speaker to synthesize recent rather than stale sentences. Max queue depth is 5.
     After draining, `pumpLocked()` combines all pending into a single synthesis call
     for better prosody continuity across sentence boundaries.
+
+34. **`SCContentSharingPicker.shared.isActive = true` stops every SCStream that
+    isn't registered with the picker.** First mid-session "pick target" implementation
+    used the system picker. Within seconds the `SystemAudioSource` stream died with
+    `Stream was stopped by the system` (SCK -3808). Fix: self-rolled SwiftUI chooser
+    over `SCShareableContent` (`ScreenPicker.swift`) — no global picker state, other
+    streams left alone. Don't reintroduce `SCContentSharingPicker` without first
+    registering every concurrent SCStream with it.
+
+35. **SCK letterbox is origin-aligned, not centered.** With
+    `scalesToFit + preservesAspectRatio` and a destination rect that doesn't match
+    source aspect, SCK puts the content top-left and pads right/bottom. Compositing
+    later in ffmpeg can't recover the centering because the SCK frame is already
+    target-sized with bars baked in. Fix: pick the writer/capture dims to *match
+    source aspect* (`ScreenVideoRecorder.pickDimensions`) so SCK never has to
+    letterbox; ffmpeg's `pad=1280:720:(ow-iw)/2:(oh-ih)/2` then centers properly on
+    the final canvas.
+
+36. **AVAssetWriter MOV `-c:v copy` into MKV failed (ffmpeg exit 183) when the
+    captured window resized mid-segment** — varying frame sizes in the MOV's
+    sample-description boxes confused the MKV muxer. Compounded by being structurally
+    incompatible with multi-segment composition anyway. Resolved by always re-encoding
+    via `libx264` from the `filter_complex` output (`MKVExporter.buildArgs`). The
+    multi-segment design also means each segment uses its own AVAssetWriter, so
+    intra-segment writer state stays stable; only the chosen filter changes.
+
+37. **AVAssetWriter `startSession(atSourceTime:)` and the segment offset.** Each
+    segment records its first frame's PTS via `CMSampleBufferGetPresentationTimeStamp`,
+    starts the writer session at that PTS, and writes
+    `(Date() - runStartedAt)` as a plain-text sidecar `<stamp>.screen.NNN.offset`.
+    `MKVExporter` reads the offset and shifts the segment via
+    `setpts=PTS-STARTPTS+<offset>/TB` in the filter graph so it lands at the right
+    spot on the audio timeline. Forgetting any one of those three (PTS session start,
+    offset sidecar, filter setpts) gives a video that drifts away from the SRT cues.

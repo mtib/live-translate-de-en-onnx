@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Combine
+import ScreenCaptureKit
 import Translation
 
 /// Local port that `LiveAudioServer` listens on when a TTS voice is
@@ -142,6 +143,23 @@ final class Pipeline: ObservableObject {
     /// the whole stream feature is skipped (icon stays hidden).
     private var ttsSpeaker: OnnxTTSSpeaker?
     private var liveAudioServer: LiveAudioServer?
+
+    /// Optional screen-recording target. Settable any time:
+    /// pre-session it just primes the next run; mid-session, combined
+    /// with `startScreenRecording()` or `changeScreenRecording(to:)`,
+    /// it drives segment switches. Each start/stop/change closes one
+    /// segment file and (where applicable) opens the next — the MKV
+    /// composer lays them out on a fixed 1280×720 canvas at the right
+    /// time offsets, letterboxed to fit.
+    @Published private(set) var screenFilter: SCContentFilter?
+    /// True while a screen-recording segment is actively writing.
+    /// Drives UI affordances (Stop / Change buttons mid-session).
+    @Published private(set) var isScreenRecording: Bool = false
+    /// Currently-writing recorder, if any.
+    private var screenRecorder: ScreenVideoRecorder?
+    /// Monotonically-increasing segment counter for the current run.
+    /// Resets on each new session.
+    private var screenSegmentIndex: Int = 0
 
     /// Set by a settings-change observer; read by run()'s defer. When
     /// true after the current run winds down, defer spawns a fresh run.
@@ -418,6 +436,76 @@ final class Pipeline: ObservableObject {
         }
     }
 
+    /// Set (or clear) the recording target. When called while a
+    /// segment is actively writing, **only updates the stored
+    /// filter** — it does not stop or restart recording. Use
+    /// `changeScreenRecording(to:)` to swap segments mid-session.
+    func setScreenFilter(_ filter: SCContentFilter?) {
+        screenFilter = filter
+    }
+
+    /// Open a new segment using the current `screenFilter`. No-op if
+    /// not running, no filter set, or a segment is already writing.
+    /// Called from the UI when the user wants to start recording
+    /// after the session is already underway.
+    func startScreenRecording() {
+        guard isActive, let filter = screenFilter, screenRecorder == nil,
+              let outputs = currentOutputs else { return }
+        Task { await openScreenSegment(filter: filter, outputs: outputs) }
+    }
+
+    /// Finalize the active segment without starting a new one. The
+    /// MKV will end up with whatever was captured up to this point,
+    /// with the rest of the session showing the black background
+    /// from the composer base layer.
+    func stopScreenRecording() {
+        guard let recorder = screenRecorder else { return }
+        screenRecorder = nil
+        isScreenRecording = false
+        Task { await recorder.stop() }
+    }
+
+    /// Replace the active recording target — finalizes the current
+    /// segment and opens a new one with the given filter. If no
+    /// segment is currently writing, this is equivalent to
+    /// `setScreenFilter(filter)` + `startScreenRecording()`. Safe to
+    /// call from anywhere; the segment finalize runs in the
+    /// background so the UI doesn't block.
+    func changeScreenRecording(to filter: SCContentFilter) {
+        screenFilter = filter
+        guard isActive, let outputs = currentOutputs else { return }
+        let previous = screenRecorder
+        screenRecorder = nil
+        isScreenRecording = false
+        Task {
+            if let previous { await previous.stop() }
+            await openScreenSegment(filter: filter, outputs: outputs)
+        }
+    }
+
+    /// Internal: create + start a `ScreenVideoRecorder` for the next
+    /// segment slot. On failure, leaves `isScreenRecording = false`
+    /// and the rest of the pipeline unaffected.
+    private func openScreenSegment(filter: SCContentFilter, outputs: Paths.Outputs) async {
+        screenSegmentIndex += 1
+        let index = screenSegmentIndex
+        let recorder = ScreenVideoRecorder(
+            filter: filter,
+            outputURL: outputs.screenSegmentMov(index),
+            offsetURL: outputs.screenSegmentOffset(index),
+            runStartedAt: runStartedAt
+        )
+        do {
+            try await recorder.start()
+            self.screenRecorder = recorder
+            self.isScreenRecording = true
+        } catch {
+            Log.line("ScreenVideoRecorder.start failed (segment \(index)): \(error.localizedDescription)")
+            self.screenRecorder = nil
+            self.isScreenRecording = false
+        }
+    }
+
     /// The View calls this from `.translationTask` to hand us a fresh
     /// `TranslationSession`. Hides the AppleTranslator downcast.
     func installTranslationSession(_ session: TranslationSession?) {
@@ -453,6 +541,16 @@ final class Pipeline: ObservableObject {
             partialTranslationTimers.removeAll()
             ttsSpeaker?.stop()
             ttsSpeaker = nil
+            // Defensive: if we exited early (e.g. permission failure)
+            // without hitting step 8b, make sure the recorder is torn
+            // down. `stop()` is async — fire-and-forget here is fine
+            // because there's no MKV step waiting on it on this path.
+            if let recorder = screenRecorder {
+                Task { await recorder.stop() }
+                screenRecorder = nil
+            }
+            isScreenRecording = false
+            screenSegmentIndex = 0
             liveAudioServer?.stop()
             liveAudioServer = nil
             liveStreamURL = nil
@@ -516,6 +614,16 @@ final class Pipeline: ObservableObject {
             return
         }
         currentOutputs = outputs
+
+        // 4a. Optional screen recording — first segment.
+        //     Reset the segment counter so segment files are named
+        //     starting at 001 for this run. If no filter is armed,
+        //     `openScreenSegment` is skipped entirely (MKV composer
+        //     falls back to a black background).
+        screenSegmentIndex = 0
+        if let filter = screenFilter {
+            await openScreenSegment(filter: filter, outputs: outputs)
+        }
 
         // 4. Build per-source pipelines (just a recorder per stream —
         //    SRT writing happens at the merged level in
@@ -604,6 +712,14 @@ final class Pipeline: ObservableObject {
 
         // 8. Final audio cleanup. Each `stop()` is idempotent.
         for sp in sourcePipelines.values { await sp.stop() }
+        // 8b. Finalize the active screen segment (if any) so the .mov
+        //     is fully written before MKVExporter reads it. Idempotent
+        //     with the defer-driven nil-out below.
+        if let recorder = screenRecorder {
+            await recorder.stop()
+            screenRecorder = nil
+            isScreenRecording = false
+        }
 
         // 9. Finalize: flush writers, build MKV, zip work dir → docs.
         //    UI shows a spinner throughout. Sentences themselves are

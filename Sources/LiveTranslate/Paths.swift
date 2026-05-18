@@ -70,9 +70,49 @@ enum Paths {
 
         /// `<workDir>/<stamp>.mkv` — final per-session video bundle:
         /// merged audio (amix'd from per-source WAVs) + both
-        /// language SRTs embedded over a 640×360 black frame.
+        /// language SRTs embedded over either the screen recording
+        /// (if `screenVideo` is present) or a 1280×720 black frame.
         var mkvOutput: URL {
             workDir.appendingPathComponent("\(timestamp).mkv")
+        }
+
+        /// `<workDir>/<stamp>.screen.NNN.mov` — one segment of the
+        /// optional screen recording (10 fps / 1280×720 / 500 kbps
+        /// H.264). A session can produce zero or more segments — the
+        /// user can start, stop, and change targets mid-session, each
+        /// of which closes the current segment and (where applicable)
+        /// opens a new one. Intermediates only; composed into the
+        /// MKV's video track via ffmpeg filter graph.
+        func screenSegmentMov(_ index: Int) -> URL {
+            workDir.appendingPathComponent(String(format: "%@.screen.%03d.mov", timestamp, index))
+        }
+
+        /// Sidecar text file holding the wall-clock offset of the
+        /// segment's first frame relative to `runStartedAt`, in
+        /// seconds. Read by `MKVExporter` to place the segment at
+        /// the correct slot on the composed timeline.
+        func screenSegmentOffset(_ index: Int) -> URL {
+            workDir.appendingPathComponent(String(format: "%@.screen.%03d.offset", timestamp, index))
+        }
+
+        /// Enumerate all `.screen.NNN.mov` files in the work dir,
+        /// ordered by segment index. Used by `MKVExporter` and
+        /// `CrashRecovery` so the composer doesn't need to know how
+        /// many segments the session produced.
+        func screenSegments() -> [(index: Int, mov: URL, offset: URL)] {
+            let fm = FileManager.default
+            guard let entries = try? fm.contentsOfDirectory(at: workDir, includingPropertiesForKeys: nil) else { return [] }
+            let prefix = "\(timestamp).screen."
+            let suffix = ".mov"
+            var hits: [(Int, URL, URL)] = []
+            for url in entries {
+                let name = url.lastPathComponent
+                guard name.hasPrefix(prefix), name.hasSuffix(suffix) else { continue }
+                let mid = name.dropFirst(prefix.count).dropLast(suffix.count)
+                guard let idx = Int(mid) else { continue }
+                hits.append((idx, url, screenSegmentOffset(idx)))
+            }
+            return hits.sorted { $0.0 < $1.0 }
         }
 
         /// The files that go into the user-facing zip: just the
