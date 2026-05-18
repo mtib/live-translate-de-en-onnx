@@ -6,6 +6,11 @@ struct LiveTranslateApp: App {
     /// Captured once by `WindowAccessor` so the menu-bar Show/Hide action
     /// can order the window in/out without going through NSApp.windows.
     @State private var mainWindow: NSWindow?
+    /// Tracked explicitly because NSWindow.isVisible is not observable —
+    /// SwiftUI can't re-render the menu label based on it changing.
+    /// The close button is hidden so this can only change through our
+    /// own Show/Hide action, making manual tracking reliable.
+    @State private var isWindowVisible = true
 
     init() {
         Log.startup()  // truncates the log if it's grown past the cap
@@ -52,14 +57,15 @@ struct LiveTranslateApp: App {
         // state so it stays above full-screen content without stealing
         // focus from whatever the user is watching.
         MenuBarExtra {
-            Button(mainWindow?.isVisible == true ? "Hide overlay" : "Show overlay") {
-                if mainWindow?.isVisible == true {
+            Button(isWindowVisible ? "Hide overlay" : "Show overlay") {
+                if isWindowVisible {
                     mainWindow?.orderOut(nil)
                 } else {
-                    // orderFront without activating — keeps focus in the
-                    // full-screen app rather than switching away from it.
+                    // orderFrontRegardless keeps focus in the full-screen
+                    // app rather than switching away from it.
                     mainWindow?.orderFrontRegardless()
                 }
+                isWindowVisible.toggle()
             }
             .keyboardShortcut("l", modifiers: [.command, .shift])
 
