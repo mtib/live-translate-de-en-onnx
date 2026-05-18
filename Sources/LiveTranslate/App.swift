@@ -60,7 +60,10 @@ struct LiveTranslateApp: App {
                 mainWindow: mainWindow
             )
         } label: {
-            Image(systemName: pipeline.isRunning ? "waveform.circle.fill" : "waveform.circle")
+            // Matches the app icon symbol. Fill signals recording in progress.
+            Image(systemName: pipeline.isRunning
+                ? "bubble.left.and.text.bubble.right.fill"
+                : "bubble.left.and.text.bubble.right")
         }
         .menuBarExtraStyle(.window)
     }
