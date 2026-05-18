@@ -59,8 +59,14 @@ actor TopicSummarizer {
             instructions: """
             You analyze live conversation transcripts and produce a short topic \
             label and a two-sentence summary. Be concise and factual. \
-            If the topic hasn't changed from the previous cycle, return a \
-            slightly refined version rather than inventing a new one. \
+            Focus exclusively on the content being discussed — what is actually \
+            being said, decided, or debated. Never mention the type of meeting, \
+            who is present, how many speakers there are, or any other meta \
+            information about the conversation itself; the listener already knows \
+            all of that. \
+            If the topic or summary has not changed since the previous cycle, \
+            return them exactly as they were. Only update when the content has \
+            meaningfully changed. \
             Always reply in exactly two lines: \
             "Topic: <short phrase>" and "Summary: <two sentences>". \
             Do not include any other text.
