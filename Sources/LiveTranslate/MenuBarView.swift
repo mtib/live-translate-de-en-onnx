@@ -12,11 +12,27 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             compactBar
+            if let s = pipeline.transcriptSummary {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(s.topic)
+                        .font(.caption.bold())
+                        .lineLimit(1)
+                    Text(s.summary)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 4)
+                .transition(.opacity)
+            }
             sentenceList
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .frame(width: 340)
+        .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary != nil)
     }
 
     // MARK: - Bar
