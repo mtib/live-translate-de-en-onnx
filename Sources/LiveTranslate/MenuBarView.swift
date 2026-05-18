@@ -113,7 +113,8 @@ struct MenuBarView: View {
                 .animation(.easeInOut(duration: 0.18), value: displayRows.map(\.id))
                 .animation(.easeInOut(duration: 0.18), value: displayRows.map(\.bodyKey))
             }
-            .frame(minHeight: 50, maxHeight: 300)
+            // ~6 compact rows: callout font (~16pt) + 6pt spacing = ~22pt/row
+            .frame(minHeight: 50, maxHeight: 132)
             .scrollIndicators(.hidden)
             .onChange(of: displayRows.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.12)) {
