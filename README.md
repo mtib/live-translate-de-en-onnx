@@ -10,8 +10,9 @@ per-source + merged SRTs, the JSONL log, and a ready-to-watch `.mkv`
 (640×360, both subtitle tracks embedded).
 
 The app also **streams synthesized translations over the LAN** using an
-on-device ONNX TTS model — open `http://<mac-ip>:8765/` on a phone with
-headphones and listen to near-real-time translated audio.
+on-device ONNX TTS model. Open `http://<mac-ip>:8765/` in a browser to
+get a dark-mode listen page with a Listen button, real-time audio, and a
+live transcript fed over SSE — no app needed on the phone.
 
 ![Default layout](docs/default.png)
 ![Compact layout](docs/compact.png)
@@ -69,8 +70,17 @@ language, a radio-waves icon (⋰) appears in the toolbar. Click it to see:
 - The stream URL (`http://<lan-ip>:8765/`) — click to copy
 - A QR code to scan with a phone on the same Wi-Fi
 
-The stream is a plain HTTP WAV — open it in VLC, mpv, or iOS Safari.
-Chrome works. QuickTime buffers heavily (30+ s), so avoid it.
+Opening the URL in a browser shows a dark-mode listen page. Hit **Listen**
+and the page plays the audio live, auto-resyncing when it falls behind.
+A scrolling transcript shows each translation alongside the original text
+and timestamp, fed by a server-sent events stream at `/events`.
+
+The icon turns **green** while a listener is connected to the audio stream
+so you get instant visual feedback that the phone picked up the feed.
+
+For players that prefer a direct stream, `/live.wav` is a plain HTTP WAV —
+open it in VLC, mpv, or iOS Safari. Chrome works. QuickTime buffers heavily
+(30+ s), so avoid it.
 
 ## How it works
 
@@ -98,8 +108,10 @@ throttle on partial updates and a final pass when the sentence is
 complete.
 
 **TTS + streaming:** Finalized translations are synthesized by
-kitten-mini (ONNX, on-device) and streamed as 24 kHz PCM16 LE WAV over
-a hand-rolled `NWListener` HTTP server.
+kitten-mini (ONNX, on-device) only when at least one listener is connected
+to the audio stream — synthesis is skipped when nobody is tuned in.
+Audio is streamed as 24 kHz PCM16 LE WAV over a hand-rolled `NWListener`
+HTTP server.
 
 **Crosstalk suppression:** Mic samples are zeroed while system audio is
 active (250 ms window), so the mic track doesn't transcribe speaker
@@ -107,7 +119,9 @@ bleed.
 
 **Output:** Non-overlapping, voice-onset-anchored timestamps in both
 JSONL and SRT. End times reflect when speech actually stopped (last
-voiced sample), not the end of the trailing silence buffer. At Stop,
+voiced sample), not the end of the trailing silence buffer. Merged SRTs
+contain plain cue text — no `[Mic]`/`[Sys]` prefix on any line,
+including the subtitle tracks embedded in the `.mkv`. At Stop,
 ffmpeg wraps the WAVs + SRTs into an MKV and everything is zipped to
 `~/Documents/LiveTranslate/<stamp>.zip`.
 
