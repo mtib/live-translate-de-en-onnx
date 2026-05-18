@@ -232,10 +232,20 @@ final class Pipeline: ObservableObject {
                          createdAt: createdAt, endsAt: endedAt)
                 return
             }
-            // Need to translate. Mark "translating" and dispatch.
+            // Need to translate. If a partial translation is already on
+            // the row, keep showing it (no italic "translating" flash) —
+            // graduate() will swap it for the final translation in place
+            // when the translator returns. Only show the "translating"
+            // placeholder when there's nothing better to display.
             if let idx = inflightChunks.firstIndex(where: { $0.id == id }) {
-                inflightChunks[idx].state = .translating(text: text)
-                Log.line("lifecycle[\(source.rawValue)]: state → translating, dispatching translator (id=\(id.uuidString.prefix(8)))")
+                if case .partial(_, let existing) = inflightChunks[idx].state,
+                   let t = existing, !t.isEmpty {
+                    inflightChunks[idx].state = .partial(text: text, translation: t)
+                    Log.line("lifecycle[\(source.rawValue)]: endpoint with partial translation, holding (id=\(id.uuidString.prefix(8)))")
+                } else {
+                    inflightChunks[idx].state = .translating(text: text)
+                    Log.line("lifecycle[\(source.rawValue)]: state → translating, dispatching translator (id=\(id.uuidString.prefix(8)))")
+                }
             }
             // Explicit `@MainActor` on the Task closure so isolation
             // doesn't depend on Swift 5 inheritance heuristics. The
@@ -298,11 +308,15 @@ final class Pipeline: ObservableObject {
         enforceMaxCount()
     }
 
-    /// Write a freshly-graduated sentence to disk: shared JSONL +
-    /// per-language merged SRTs. All writes are queue-backed so this
-    /// returns immediately.
+    /// Write a freshly-graduated sentence to disk (shared JSONL +
+    /// per-language merged SRTs) and broadcast the same JSONL line on
+    /// the listen-page SSE channel. All writes are queue-backed so
+    /// this returns immediately.
     private func recordSentence(_ s: Sentence) {
         archive?.append(s)
+        if let line = TranscriptArchive.encodeLine(s) {
+            liveAudioServer?.publishTranscript(jsonLine: line)
+        }
         let start = s.createdAt.timeIntervalSince(runStartedAt)
         let end = max(start, s.endsAt.timeIntervalSince(runStartedAt))
         let srcLang = String(source.identifier.prefix(2))
