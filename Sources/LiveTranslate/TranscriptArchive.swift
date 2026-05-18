@@ -48,17 +48,11 @@ final class TranscriptArchive {
     /// Append one sentence record. Returns immediately; actual disk IO
     /// happens asynchronously on the archive's queue.
     func append(_ sentence: Sentence) {
-        let record = Record(
-            start: Self.isoFormatter.string(from: sentence.createdAt),
-            end: Self.isoFormatter.string(from: sentence.endsAt),
-            source: sentence.source.rawValue,
-            transcription: sentence.text,
-            translation: sentence.translation
-        )
+        guard let line = Self.encodeLine(sentence) else { return }
         let url = self.url
         queue.async {
             do {
-                var data = try Self.encoder.encode(record)
+                var data = line.data(using: .utf8) ?? Data()
                 data.append(0x0A)  // \n
                 let h = try FileHandle(forWritingTo: url)
                 defer { try? h.close() }
@@ -68,6 +62,24 @@ final class TranscriptArchive {
                 Log.line("TranscriptArchive: append failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// One JSON object (no trailing newline) for a sentence — the same
+    /// shape we write to the JSONL file. Exposed so the live HTTP SSE
+    /// stream can broadcast the exact same payload to web listeners.
+    static func encodeLine(_ sentence: Sentence) -> String? {
+        let record = Record(
+            start: isoFormatter.string(from: sentence.createdAt),
+            end: isoFormatter.string(from: sentence.endsAt),
+            source: sentence.source.rawValue,
+            transcription: sentence.text,
+            translation: sentence.translation
+        )
+        guard let data = try? encoder.encode(record),
+              let s = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return s
     }
 
     private struct Record: Encodable {
