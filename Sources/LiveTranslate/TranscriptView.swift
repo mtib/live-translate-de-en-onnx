@@ -244,14 +244,13 @@ struct TranscriptView: View {
                 // pruned) gets the .transition(.opacity) treatment via
                 // ID changes.
                 .animation(.easeInOut(duration: 0.18), value: displayRows.map(\.id))
-                // Same-identity content swaps (listening → partial →
-                // translation visible → graduated) also fade — but
-                // only when the row crosses a kind boundary, so
-                // letter-by-letter partial growth still renders
-                // instantly without churning. Paired with
-                // `.contentTransition(.opacity)` on the Text views
-                // inside `TranscriptRow`.
-                .animation(.easeInOut(duration: 0.18), value: displayRows.map(\.kindKey))
+                // Any visible content change on an existing row —
+                // partial-text growth, partial translation refining,
+                // graduation — runs through this animation context.
+                // Combined with `.contentTransition(.opacity)` on the
+                // Text views inside `TranscriptRow`, each change
+                // cross-fades smoothly.
+                .animation(.easeInOut(duration: 0.18), value: displayRows.map(\.bodyKey))
             }
             .frame(minHeight: compact ? 50 : 140)
             .scrollIndicators(.hidden)
@@ -290,21 +289,24 @@ private enum DisplayRow: Identifiable, Equatable {
         }
     }
 
-    /// A coarse classifier for "what kind of row is this rendering right
-    /// now". Changes only when the row crosses a meaningful visual
-    /// boundary (e.g. listening → partial → translation visible →
-    /// graduated). Stays the same as raw partial text grows letter by
-    /// letter, so the fade animation fires once per real state change
-    /// rather than on every ASR tick.
-    var kindKey: String {
+    /// A key derived from everything `TranscriptRow` actually renders,
+    /// so any change — kind transitions, partial-text growth, partial
+    /// translation refinement, graduation — fires the surrounding
+    /// `.animation(_, value:)` context. Combined with
+    /// `.contentTransition(.opacity)` on the Text views, every change
+    /// cross-fades smoothly. Includes a leading discriminator so two
+    /// states that happen to stringify to the same content (e.g. an
+    /// inflight `.partial("foo", nil)` and a `.translating("foo")`)
+    /// still register as distinct values.
+    var bodyKey: String {
         switch self {
-        case .sentence:                             return "sentence"
+        case .sentence(let s):
+            return "S\u{1F}\(s.translation)\u{1F}\(s.text)"
         case .inflight(let c):
             switch c.state {
-            case .listening:                        return "listening"
-            case .partial(_, .none):                return "partial"
-            case .partial(_, .some):                return "partial+trans"
-            case .translating:                      return "translating"
+            case .listening:                              return "L"
+            case .partial(let t, let trans):              return "P\u{1F}\(t)\u{1F}\(trans ?? "")"
+            case .translating(let t):                     return "T\u{1F}\(t)"
             }
         }
     }
