@@ -13,11 +13,21 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             compactBar
+            if let s = pipeline.transcriptSummary, !s.summary.isEmpty {
+                Text(s.summary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
             sentenceList
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .frame(width: 340)
+        .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary?.summary)
     }
 
     // MARK: - Bar
@@ -145,20 +155,6 @@ struct MenuBarView: View {
             // Summary sits here (not in parent VStack) so its appearance never
             // changes the ScrollView frame — safeAreaInset adjusts content
             // offset instead, keeping the bottom anchor stable.
-            .safeAreaInset(edge: .top, spacing: 0) {
-                if let s = pipeline.transcriptSummary, !s.summary.isEmpty {
-                    Text(s.summary)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 4)
-                        .background(.regularMaterial)
-                        .transition(.opacity)
-                        .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary?.summary)
-                }
-            }
             .onChange(of: displayRows.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.12)) {
                     proxy.scrollTo("BOTTOM", anchor: .bottom)

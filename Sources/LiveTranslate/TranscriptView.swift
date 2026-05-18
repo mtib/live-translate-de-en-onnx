@@ -72,19 +72,23 @@ struct TranscriptView: View {
         if compactMode {
             VStack(alignment: .leading, spacing: 6) {
                 compactBar
+                summaryBar
                 sentenceList(compact: true)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+            .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary?.summary)
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 fullBar
                 if case .stopped(let reason) = pipeline.status {
                     errorBanner(reason)
                 }
+                summaryBar
                 sentenceList(compact: false)
             }
             .padding(14)
+            .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary?.summary)
         }
     }
 
@@ -198,8 +202,6 @@ struct TranscriptView: View {
                 .lineLimit(3)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 4)
-                .background(Color(nsColor: .textBackgroundColor).opacity(0.85))
                 .transition(.opacity.combined(with: .move(edge: .top)))
         }
     }
@@ -303,14 +305,6 @@ struct TranscriptView: View {
             }
             .frame(minHeight: compact ? 50 : 140)
             .scrollIndicators(.hidden)
-            // The summary bar lives here rather than in the parent VStack so that
-            // its appearance / resize never changes the ScrollView's frame. A
-            // safeAreaInset adjusts the scroll content's offset instead — the
-            // bottom anchor stays put and there is no visible scroll jump.
-            .safeAreaInset(edge: .top, spacing: 0) {
-                summaryBar
-                    .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary?.summary)
-            }
             .onChange(of: displayRows.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.12)) {
                     proxy.scrollTo("BOTTOM", anchor: .bottom)
