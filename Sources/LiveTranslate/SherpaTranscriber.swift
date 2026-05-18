@@ -45,14 +45,25 @@ final class SherpaTranscriber: Transcriber {
     /// How long after system-voiced we keep treating mic as contaminated.
     static let crosstalkPersistSeconds: TimeInterval = 0.25
 
-    /// Silence gap that triggers a speaker-boundary row split mid-turn.
-    /// Detected in the accumulator at each new voiced onset: if silence since
-    /// the last voiced segment is ≥ this threshold the current hypothesis is
-    /// force-completed and a fresh chunk begins — no word-distribution needed.
-    /// Kept in sync with `endpointSilenceSeconds`: anything shorter would
-    /// pre-empt sherpa's own endpoint and split mid-word on natural breaths
-    /// (e.g. "Das Kä-<breath>-selab" → "Das Kä" / "selab …").
-    private static let vadSplitGapSamples: Int = Int(1.8 * 16_000)
+    /// Sherpa rule-2: any trailing silence long enough that we stop
+    /// waiting for the speaker to resume mid-sentence. Mirrors what we
+    /// pass to sherpa-onnx; also used by the semantic endpoint
+    /// suppression below as "if silence has grown past this, commit
+    /// regardless of terminal punctuation".
+    static let rule2SilenceSeconds: Float = 2.4
+
+    /// Sherpa rule-3: hard cap on a single utterance regardless of trailing
+    /// silence. 20 s scalpels long natural sentences with dense speech mid-
+    /// stride; raise to 60 s so it functions as a true fallback. The
+    /// semantic mid-sentence endpoint suppression keeps things from running
+    /// unbounded in practice.
+    static let maxUtteranceSeconds: Float = 60.0
+
+    /// Returns true for `.`, `?`, `!` — the terminators we treat as
+    /// "this hypothesis looks complete; safe to commit".
+    static func isSentenceFinalPunct(_ c: Character) -> Bool {
+        c == "." || c == "?" || c == "!"
+    }
 
     /// Once the active partial exceeds this many characters the accumulator
     /// looks for a sentence-ending punctuation boundary (`. `, `? `, `! `)
@@ -116,8 +127,8 @@ final class SherpaTranscriber: Transcriber {
         cfg.feat_config.feature_dim = 80
         cfg.enable_endpoint = 1
         cfg.rule1_min_trailing_silence = Self.endpointSilenceSeconds
-        cfg.rule2_min_trailing_silence = 2.4
-        cfg.rule3_min_utterance_length = 20.0
+        cfg.rule2_min_trailing_silence = Self.rule2SilenceSeconds
+        cfg.rule3_min_utterance_length = Self.maxUtteranceSeconds
         cfg.model_config.num_threads = Int32(max(2, ProcessInfo.processInfo.activeProcessorCount - 2))
         cfg.model_config.debug = 0
 
@@ -247,16 +258,15 @@ final class SherpaTranscriber: Transcriber {
         defer { SherpaOnnxDestroyOnlineStream(stream) }
 
         // Turn-level bookkeeping.
-        var turnStartSample = 0     // voice onset of the current ASR turn
-        var chunkStartSample = 0    // voice onset of the current *chunk* (advances after splits)
+        var chunkStartSample = 0    // voice onset of the current *chunk*
         var cumulativeSamples = 0
         var chunkIndex = 0
         var currentChunkID: UUID? = nil
         var hadVoice = false
 
-        // Gap-split tracking: sample at which the last voiced segment ended,
-        // used to detect speaker-boundary silences at the next voiced onset
-        // and to produce accurate speech-end timestamps.
+        // End-of-voice tracking: the sample at which the last voiced segment
+        // ended (so chunks finish at last-voiced-sample, not at end of the
+        // trailing silence buffer the recognizer waits through).
         var lastVoicedEndSample = 0
         var prevVoiced = false
 
@@ -304,56 +314,20 @@ final class SherpaTranscriber: Transcriber {
 
             if voiced {
                 if !hadVoice {
-                    // First voiced onset of this turn.
+                    // First voiced onset of this turn — open the UI row
+                    // immediately so the user sees "listening" before any
+                    // text has been decoded.
                     let id = UUID()
                     currentChunkID = id
-                    turnStartSample = samplesBefore
                     chunkStartSample = samplesBefore
                     chunkIndex += 1
                     Log.line("SherpaTranscriber[\(tag)]: voice onset #\(chunkIndex) (id=\(id.uuidString.prefix(8))) at \(String(format:"%.2f",Double(samplesBefore)/16_000))s")
                     onChunkLifecycle?(id, source, .listening)
                     hadVoice = true
-                } else if !prevVoiced {
-                    // New voiced onset after silence — check for speaker-boundary gap.
-                    let gap = samplesBefore - lastVoicedEndSample
-                    if gap >= Self.vadSplitGapSamples, let id = currentChunkID {
-                        // Long silence: force-complete current hypothesis and start
-                        // a fresh chunk for the next speaker / utterance.
-                        let h: String
-                        if let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) {
-                            h = normalizeHypothesis(
-                                String(cString: result.pointee.text)
-                                    .trimmingCharacters(in: .whitespacesAndNewlines))
-                            SherpaOnnxDestroyOnlineRecognizerResult(result)
-                        } else { h = "" }
-                        let splitRemainder = committedLength == 0 ? h
-                            : String(h.dropFirst(min(committedLength, h.count)))
-                                .trimmingCharacters(in: .whitespacesAndNewlines)
-                        let hasContent = splitRemainder.rangeOfCharacter(from: .alphanumerics) != nil
-                        if !splitRemainder.isEmpty && hasContent {
-                            Log.line("SherpaTranscriber[\(tag)]: VAD gap \(String(format:"%.2f",Double(gap)/16_000))s → splitting chunk #\(chunkIndex)")
-                            sink.yield(TurnRecord(
-                                chunkID: id, index: chunkIndex,
-                                text: splitRemainder,
-                                startSample: chunkStartSample,
-                                endSample: lastVoicedEndSample  // when speech actually ended
-                            ))
-                        } else {
-                            onChunkLifecycle?(id, source, .dropped)
-                        }
-                        SherpaOnnxOnlineStreamReset(recognizer, stream)
-                        committedLength = 0
-                        lastPartialText = ""
-                        turnStartSample = samplesBefore   // new turn starts at new voice onset
-                        chunkStartSample = samplesBefore  // new chunk starts at new voice onset
-                        chunkIndex += 1
-                        let newID = UUID()
-                        currentChunkID = newID
-                        onChunkLifecycle?(newID, source, .listening)
-                    }
                 }
             } else if prevVoiced {
-                // Voiced → silent transition: record when voice ended.
+                // Voiced → silent transition: record when voice ended so
+                // chunk end times anchor on the last voiced sample.
                 lastVoicedEndSample = samplesBefore
             }
 
@@ -434,6 +408,27 @@ final class SherpaTranscriber: Transcriber {
                     : String(fullText.dropFirst(min(committedLength, fullText.count)))
                         .trimmingCharacters(in: .whitespacesAndNewlines)
 
+                // Semantic suppression: if the hypothesis isn't sentence-
+                // final yet (no `.`/`?`/`!` terminator) AND the trailing
+                // silence is still inside the rule-2 envelope AND we
+                // haven't hit the utterance hard cap, *don't* reset.
+                // Sherpa's rule-1 endpoint fires on every 1.8 s gap, but
+                // German talkers routinely take longer breaths inside one
+                // grammatical sentence — committing here splits e.g.
+                // "…die kleinen Kügelchen, die dran" / "hängen.".
+                let trailingSilenceSec = Double(cumulativeSamples - lastVoicedEndSample) / 16_000
+                let utteranceSec       = Double(cumulativeSamples - chunkStartSample) / 16_000
+                let hasTerminal        = fullText.last.map(Self.isSentenceFinalPunct) ?? false
+                let withinRule2Gap     = trailingSilenceSec < Double(Self.rule2SilenceSeconds)
+                let withinHardCap      = utteranceSec < Double(Self.maxUtteranceSeconds) - 1.0
+                if !hasTerminal, !remainder.isEmpty, withinRule2Gap, withinHardCap {
+                    // Don't reset. Sherpa won't refire IsEndpoint until
+                    // more voiced-then-silent audio accrues, so we just
+                    // let the recognizer keep going.
+                    Log.line("SherpaTranscriber[\(tag)]: endpoint suppressed mid-sentence (silence=\(String(format:"%.2f",trailingSilenceSec))s, utterance=\(String(format:"%.1f",utteranceSec))s)")
+                    continue
+                }
+
                 Log.line("SherpaTranscriber[\(tag)]: endpoint chunk #\(chunkIndex) remainder=\"\(remainder.prefix(60))\"")
 
                 // If the ASR revised the final hypothesis to append trailing
@@ -460,7 +455,6 @@ final class SherpaTranscriber: Transcriber {
 
                 SherpaOnnxOnlineStreamReset(recognizer, stream)
                 committedLength = 0
-                turnStartSample = cumulativeSamples
                 chunkStartSample = cumulativeSamples
                 currentChunkID = nil
                 hadVoice = false
