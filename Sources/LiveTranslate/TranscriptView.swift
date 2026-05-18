@@ -240,7 +240,18 @@ struct TranscriptView: View {
                     Color.clear.frame(height: 1).id("BOTTOM")
                 }
                 .padding(.vertical, 2)
+                // Row add/remove (a new chunk arrives, a sentence is
+                // pruned) gets the .transition(.opacity) treatment via
+                // ID changes.
                 .animation(.easeInOut(duration: 0.18), value: displayRows.map(\.id))
+                // Same-identity content swaps (listening → partial →
+                // translation visible → graduated) also fade — but
+                // only when the row crosses a kind boundary, so
+                // letter-by-letter partial growth still renders
+                // instantly without churning. Paired with
+                // `.contentTransition(.opacity)` on the Text views
+                // inside `TranscriptRow`.
+                .animation(.easeInOut(duration: 0.18), value: displayRows.map(\.kindKey))
             }
             .frame(minHeight: compact ? 50 : 140)
             .scrollIndicators(.hidden)
@@ -278,6 +289,25 @@ private enum DisplayRow: Identifiable, Equatable {
         case .inflight(let c):  return c.id
         }
     }
+
+    /// A coarse classifier for "what kind of row is this rendering right
+    /// now". Changes only when the row crosses a meaningful visual
+    /// boundary (e.g. listening → partial → translation visible →
+    /// graduated). Stays the same as raw partial text grows letter by
+    /// letter, so the fade animation fires once per real state change
+    /// rather than on every ASR tick.
+    var kindKey: String {
+        switch self {
+        case .sentence:                             return "sentence"
+        case .inflight(let c):
+            switch c.state {
+            case .listening:                        return "listening"
+            case .partial(_, .none):                return "partial"
+            case .partial(_, .some):                return "partial+trans"
+            case .translating:                      return "translating"
+            }
+        }
+    }
 }
 
 /// One completed-sentence row. Source icon (mic/speaker) on the left
@@ -312,12 +342,14 @@ private struct TranscriptRow: View {
                     .foregroundStyle(isPlaceholder ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
+                    .contentTransition(.opacity)
                 if !compact, let cap = captionText {
                     Text(cap)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
+                        .contentTransition(.opacity)
                 }
             }
         }
