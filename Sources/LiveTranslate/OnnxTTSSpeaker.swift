@@ -93,7 +93,10 @@ final class OnnxTTSSpeaker: @unchecked Sendable {
         model.debug       = 0
 
         var cfg = SherpaOnnxOfflineTtsConfig()
-        cfg.max_num_sentences = 1
+        // We batch all queued translations into one synthesis call, so
+        // sherpa-onnx needs to process several sentences per generation.
+        // The TTS queue is capped at `maxQueue` items.
+        cfg.max_num_sentences = Int32(maxQueue)
 
         guard let t = modelPath.withCString({ mP -> OpaquePointer? in
             kitten.model = mP
@@ -122,14 +125,37 @@ final class OnnxTTSSpeaker: @unchecked Sendable {
     private func pumpLocked() {
         if !busy { onActivityChanged(false) }
         guard !busy, !pending.isEmpty, tts != nil else { return }
-        let text = pending.removeFirst()
+        // Drain *all* pending sentences into a single synthesis call.
+        // Combining gives sherpa-onnx prosody context across sentence
+        // boundaries (less robotic inter-sentence transitions) and lets
+        // the queue catch up when translations arrive in bursts.
+        // Each sentence is force-terminated with a period so the TTS
+        // model sees clean sentence boundaries even if the upstream
+        // translation didn't punctuate.
+        let batch = pending.map { ensureTerminated($0) }.joined(separator: " ")
+        let count = pending.count
+        pending.removeAll()
         busy = true
-        speak(text) { [weak self] in
+        if count > 1 {
+            Log.line("OnnxTTSSpeaker: batched \(count) pending sentences into one synthesis")
+        }
+        speak(batch) { [weak self] in
             self?.q.asyncAfter(deadline: .now() + 0.5) {
                 self?.busy = false
                 self?.pumpLocked()
             }
         }
+    }
+
+    /// Append `.` if `s` doesn't already end in sentence-final
+    /// punctuation, so adjacent batched sentences don't run together as
+    /// one mega-sentence in the TTS frontend's eyes.
+    private func ensureTerminated(_ s: String) -> String {
+        guard let last = s.last else { return s }
+        if last == "." || last == "?" || last == "!" || last == "," || last == ";" || last == ":" {
+            return s
+        }
+        return s + "."
     }
 
     /// Synthesize `text` synchronously on the serial queue, convert the
