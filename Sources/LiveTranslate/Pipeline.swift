@@ -61,6 +61,11 @@ final class Pipeline: ObservableObject {
     /// QR code so a phone-with-headphones can listen along.
     @Published private(set) var liveStreamURL: String?
 
+    /// `http://<host>.local:8765/obs` — always non-nil while a run is
+    /// active (server always starts). Points to the OBS browser-source
+    /// subtitle overlay endpoint.
+    @Published private(set) var liveOBSURL: String?
+
     /// Rolling topic label + two-sentence summary produced by `TopicSummarizer`.
     /// Nil when no session is active, Apple Intelligence is unavailable, or
     /// `aiAnalysisEnabled` is false.
@@ -239,6 +244,7 @@ final class Pipeline: ObservableObject {
             inflightChunks.append(InflightChunk(
                 id: id, source: source, startedAt: Date(), state: .listening
             ))
+            liveAudioServer?.publishHypothesis(id: id, source: source.rawValue, state: "listening", text: nil, translation: nil)
 
         case .partial(let text):
             // Streaming ASR produced new tokens. Show the partial text in the
@@ -250,6 +256,10 @@ final class Pipeline: ObservableObject {
             if case .partial(_, let t) = inflightChunks[idx].state { existingTranslation = t }
             else { existingTranslation = nil }
             inflightChunks[idx].state = .partial(text: text, translation: existingTranslation)
+            let curTranslation: String?
+            if case .partial(_, let t) = inflightChunks[idx].state { curTranslation = t } else { curTranslation = nil }
+            liveAudioServer?.publishHypothesis(id: id, source: source.rawValue, state: "partial",
+                                               text: text, translation: curTranslation)
 
             let srcLang = String(self.source.identifier.prefix(2))
             let tgtLang = self.target.code
@@ -302,9 +312,12 @@ final class Pipeline: ObservableObject {
                 if case .partial(_, let existing) = inflightChunks[idx].state,
                    let t = existing, !t.isEmpty {
                     inflightChunks[idx].state = .partial(text: text, translation: t)
+                    liveAudioServer?.publishHypothesis(id: id, source: source.rawValue, state: "partial",
+                                                       text: text, translation: t)
                     Log.line("lifecycle[\(source.rawValue)]: endpoint with partial translation, holding (id=\(id.uuidString.prefix(8)))")
                 } else {
                     inflightChunks[idx].state = .translating(text: text)
+                    liveAudioServer?.publishHypothesis(id: id, source: source.rawValue, state: "translating", text: text, translation: nil)
                     Log.line("lifecycle[\(source.rawValue)]: state → translating, dispatching translator (id=\(id.uuidString.prefix(8)))")
                 }
             }
@@ -358,6 +371,7 @@ final class Pipeline: ObservableObject {
         sentences.append(sentence)
         inflightChunks.removeAll { $0.id == id }
         partialTranslationTimers.removeValue(forKey: id)
+        liveAudioServer?.publishHypothesisDone(id: id)
         recordSentence(sentence)
         // Feed the translation into the live audio stream — but only
         // if someone's actually listening. With zero subscribers on
@@ -589,6 +603,7 @@ final class Pipeline: ObservableObject {
             liveAudioServer?.stop()
             liveAudioServer = nil
             liveStreamURL = nil
+            liveOBSURL = nil
             ttsModelLoaded = false
             ttsListenerCount = 0
             recomputeTTSActive()
@@ -682,15 +697,18 @@ final class Pipeline: ObservableObject {
         }
         Log.line("Run outputs: \(outputs.workDir.path) → \(outputs.zipDestination.lastPathComponent)")
 
-        // 4c. Spin up the live translated-audio stream IF
-        //     (a) src != tgt language (otherwise it's just an echo),
+        // 4c. Spin up the live server (always — for OBS subtitle overlay
+        //     and hypothesis SSE). Layer TTS on top only when
+        //     (a) src != tgt language (otherwise it's just an echo), and
         //     (b) the kitten-mini ONNX TTS model is bundled.
-        //     If either fails, leave `ttsSpeaker` / `liveAudioServer` nil
-        //     so the UI stream icon stays hidden.
-        if srcLangCode != tgtLangCode, OnnxTTSSpeaker.isAvailable() {
-            let server = LiveAudioServer(port: liveStreamPort)
-            do {
-                try server.start()
+        let server = LiveAudioServer(port: liveStreamPort)
+        do {
+            try server.start()
+            self.liveAudioServer = server
+            self.liveOBSURL = LiveAudioServer.streamURL(port: liveStreamPort) + "obs"
+            Log.line("Live server started — OBS URL: \(self.liveOBSURL ?? "?")")
+
+            if srcLangCode != tgtLangCode, OnnxTTSSpeaker.isAvailable() {
                 let speaker = OnnxTTSSpeaker(onPCM: { [weak server] pcm in
                     server?.append(pcm)
                 }, onActivityChanged: { [weak server] active in
@@ -707,17 +725,16 @@ final class Pipeline: ObservableObject {
                         self?.recomputeTTSActive()
                     }
                 }
-                self.liveAudioServer = server
                 self.ttsSpeaker = speaker
                 self.liveStreamURL = LiveAudioServer.streamURL(port: liveStreamPort)
                 Log.line("Live audio stream: \(self.liveStreamURL ?? "?") (kitten-mini ONNX TTS)")
-            } catch {
-                Log.line("LiveAudioServer.start failed: \(error.localizedDescription) — TTS stream disabled this run")
+            } else if srcLangCode == tgtLangCode {
+                Log.line("Live audio stream: skipped (src == tgt)")
+            } else {
+                Log.line("Live audio stream: kitten-mini model not bundled — TTS stream disabled this run")
             }
-        } else if srcLangCode == tgtLangCode {
-            Log.line("Live audio stream: skipped (src == tgt)")
-        } else {
-            Log.line("Live audio stream: kitten-mini model not bundled — TTS stream disabled this run")
+        } catch {
+            Log.line("LiveAudioServer.start failed: \(error.localizedDescription) — server disabled this run")
         }
 
         status = .running
