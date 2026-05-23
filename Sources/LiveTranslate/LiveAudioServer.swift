@@ -833,6 +833,9 @@ final class LiveAudioServer: @unchecked Sendable {
       }
 
       function connectEvents() {
+        // Clear orphaned hypothesis rows from a previous connection.
+        hypothesisRows.forEach(row => row.remove());
+        hypothesisRows.clear();
         const es = new EventSource(EVENTS);
         es.onmessage = (e) => { try { onFinalized(JSON.parse(e.data)); } catch {} };
         es.addEventListener('hypothesis', (e) => { try { onHypothesis(JSON.parse(e.data)); } catch {} });
