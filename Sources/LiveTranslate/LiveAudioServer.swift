@@ -38,6 +38,8 @@ final class LiveAudioServer: @unchecked Sendable {
     private var audioSubscribers: [UUID: NWConnection] = [:]
     /// Clients consuming the SSE transcript stream (the listen page).
     private var eventSubscribers: [UUID: NWConnection] = [:]
+    /// Clients consuming the OBS overlay SSE stream.
+    private var obsSubscribers: [UUID: NWConnection] = [:]
     /// Replay buffer for SSE — every finalized sentence as a JSONL line.
     /// Capped at 200 entries so very long sessions don't grow unbounded.
     private var eventReplay: [String] = []
@@ -104,12 +106,15 @@ final class LiveAudioServer: @unchecked Sendable {
         lock.lock()
         let audio = Array(audioSubscribers.values)
         let events = Array(eventSubscribers.values)
+        let obs = Array(obsSubscribers.values)
         audioSubscribers.removeAll()
         eventSubscribers.removeAll()
+        obsSubscribers.removeAll()
         eventReplay.removeAll()
         lock.unlock()
         for c in audio { c.cancel() }
         for c in events { c.cancel() }
+        for c in obs { c.cancel() }
         listener?.cancel()
         listener = nil
     }
@@ -121,27 +126,68 @@ final class LiveAudioServer: @unchecked Sendable {
         lastSendAt = Date()
     }
 
+    /// Sends a named `hypothesis` SSE event to all event subscribers (not replayed).
+    func publishHypothesis(id: UUID, source: String, state: String, text: String?, translation: String?) {
+        var obj = "{\"id\":\"\(jsonEscape(id.uuidString))\",\"source\":\"\(jsonEscape(source))\",\"state\":\"\(jsonEscape(state))\""
+        if let t = text { obj += ",\"text\":\"\(jsonEscape(t))\"" }
+        if let tr = translation { obj += ",\"translation\":\"\(jsonEscape(tr))\"" }
+        obj += "}"
+        broadcastToEventSubscribers("event: hypothesis\ndata: \(obj)\n\n")
+    }
+
+    /// Sends a `hypothesis-done` SSE event to all event subscribers.
+    func publishHypothesisDone(id: UUID) {
+        broadcastToEventSubscribers("event: hypothesis-done\ndata: {\"id\":\"\(jsonEscape(id.uuidString))\"}\n\n")
+    }
+
+    /// Sends a subtitle data event to all OBS overlay subscribers (not replayed).
+    func publishOBSSubtitle(text: String) {
+        let payload = "data: {\"text\":\"\(jsonEscape(text))\"}\n\n"
+        guard let data = payload.data(using: .utf8) else { return }
+        lock.lock()
+        let conns = Array(obsSubscribers.values)
+        lock.unlock()
+        broadcastRaw(data, to: conns)
+    }
+
     /// Push one finalized-sentence JSONL line (same shape as the on-disk
     /// transcript) to every SSE subscriber, and buffer it so future
     /// subscribers can replay the session so far. Safe to call from
     /// any thread.
     func publishTranscript(jsonLine: String) {
-        let event = "data: \(jsonLine)\n\n".data(using: .utf8) ?? Data()
         lock.lock()
         eventReplay.append(jsonLine)
         if eventReplay.count > 200 {
             eventReplay.removeFirst(eventReplay.count - 200)
         }
-        let conns = Array(eventSubscribers.values)
         lock.unlock()
+        broadcastToEventSubscribers("data: \(jsonLine)\n\n")
+    }
+
+    // MARK: - Internals
+
+    private func broadcastRaw(_ data: Data, to conns: [NWConnection]) {
         for c in conns {
-            c.send(content: event, completion: .contentProcessed { err in
+            c.send(content: data, completion: .contentProcessed { err in
                 if err != nil { c.cancel() }
             })
         }
     }
 
-    // MARK: - Internals
+    private func broadcastToEventSubscribers(_ raw: String) {
+        guard let data = raw.data(using: .utf8) else { return }
+        lock.lock()
+        let conns = Array(eventSubscribers.values)
+        lock.unlock()
+        broadcastRaw(data, to: conns)
+    }
+
+    private func jsonEscape(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+         .replacingOccurrences(of: "\"", with: "\\\"")
+         .replacingOccurrences(of: "\n", with: "\\n")
+         .replacingOccurrences(of: "\r", with: "\\r")
+    }
 
     private func handle(_ conn: NWConnection) {
         conn.start(queue: queue)
@@ -154,6 +200,8 @@ final class LiveAudioServer: @unchecked Sendable {
             case "/":              self.serveListenPage(conn)
             case "/live.wav":      self.serveAudioStream(conn)
             case "/events":        self.serveEventStream(conn)
+            case "/obs":           self.serveOBSPage(conn)
+            case "/obs-events":    self.serveOBSEventStream(conn)
             default:               self.serveNotFound(conn)
             }
         }
@@ -239,6 +287,37 @@ final class LiveAudioServer: @unchecked Sendable {
         })
     }
 
+    private func serveOBSPage(_ conn: NWConnection) {
+        let body = Self.obsPageHTML.data(using: .utf8) ?? Data()
+        var resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(body.count)\r\nCache-Control: no-cache, no-store\r\nConnection: close\r\n\r\n".data(using: .utf8)!
+        resp.append(body)
+        conn.send(content: resp, completion: .contentProcessed { _ in conn.cancel() })
+    }
+
+    private func serveOBSEventStream(_ conn: NWConnection) {
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-store\r\nConnection: close\r\n\r\n".data(using: .utf8)!
+        let preamble = headers + (": ready\n\n".data(using: .utf8) ?? Data())
+        conn.send(content: preamble, completion: .contentProcessed { [weak self] err in
+            guard let self else { return }
+            if err != nil { conn.cancel(); return }
+            let id = UUID()
+            self.lock.lock()
+            self.obsSubscribers[id] = conn
+            self.lock.unlock()
+            Log.line("LiveAudioServer: obs-events subscriber +1 (id=\(id.uuidString.prefix(8)))")
+            conn.stateUpdateHandler = { [weak self] state in
+                switch state {
+                case .cancelled, .failed:
+                    self?.lock.lock()
+                    self?.obsSubscribers.removeValue(forKey: id)
+                    self?.lock.unlock()
+                    Log.line("LiveAudioServer: OBS subscriber -1 (id=\(id.uuidString.prefix(8)))")
+                default: break
+                }
+            }
+        })
+    }
+
     private func serveNotFound(_ conn: NWConnection) {
         let body = "404 Not Found\n".data(using: .utf8) ?? Data()
         var resp = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".data(using: .utf8)!
@@ -290,12 +369,10 @@ final class LiveAudioServer: @unchecked Sendable {
                     sseTick = 0
                     self.lock.lock()
                     let evConns = Array(self.eventSubscribers.values)
+                    let obsConns = Array(self.obsSubscribers.values)
                     self.lock.unlock()
-                    for c in evConns {
-                        c.send(content: sseHeartbeat, completion: .contentProcessed { err in
-                            if err != nil { c.cancel() }
-                        })
-                    }
+                    self.broadcastRaw(sseHeartbeat, to: evConns)
+                    self.broadcastRaw(sseHeartbeat, to: obsConns)
                 }
             }
         }
@@ -432,6 +509,102 @@ final class LiveAudioServer: @unchecked Sendable {
     /// transcript). The page auto-resyncs when audio falls behind,
     /// reconnects on the SSE channel if the connection drops, and
     /// renders the transcript as it streams in.
+    private static let obsPageHTML: String = """
+    <!DOCTYPE html>
+    <html lang="de">
+    <head>
+    <meta charset="utf-8">
+    <title>LiveTranslate OBS Overlay</title>
+    <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: transparent;
+      width: 100vw; height: 100vh;
+      overflow: hidden;
+      font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+    }
+    #stack {
+      position: fixed;
+      bottom: 6%;
+      left: 0; right: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      padding: 0 80px;
+    }
+    .sub-line {
+      font-size: 52px;
+      font-weight: 700;
+      line-height: 1.25;
+      color: #ffffff;
+      text-align: center;
+      word-wrap: break-word;
+      max-width: 100%;
+      text-shadow:
+        -3px -3px 0 #000,  3px -3px 0 #000,
+        -3px  3px 0 #000,  3px  3px 0 #000,
+        -3px  0   0 #000,  3px  0   0 #000,
+         0   -3px 0 #000,  0    3px 0 #000;
+      opacity: 1;
+      transition: opacity 0.8s ease-out;
+    }
+    .sub-line.fading { opacity: 0; }
+    </style>
+    </head>
+    <body>
+    <div id="stack"></div>
+    <script>
+    (function () {
+      const stack = document.getElementById('stack');
+      const MAX_LINES = 5;
+      const HOLD_MS  = 4000;   // fully visible
+      const FADE_MS  =  800;   // CSS transition duration
+
+      function addSubtitle(text) {
+        // Enforce max: remove oldest immediately if at cap.
+        while (stack.children.length >= MAX_LINES) {
+          stack.removeChild(stack.firstElementChild);
+        }
+
+        const el = document.createElement('div');
+        el.className = 'sub-line';
+        el.textContent = text;
+        stack.appendChild(el);
+
+        // After HOLD_MS, start CSS fade; after fade completes, remove.
+        const fadeTimer = setTimeout(() => {
+          el.classList.add('fading');
+          setTimeout(() => {
+            if (el.parentElement) el.parentElement.removeChild(el);
+          }, FADE_MS);
+        }, HOLD_MS);
+
+        // Store timer on element so forced-removal (max cap) can cancel it.
+        el._fadeTimer = fadeTimer;
+      }
+
+      // Override removeChild to cancel the pending timer for evicted lines.
+      const origRemove = stack.removeChild.bind(stack);
+      stack.removeChild = function(child) {
+        if (child._fadeTimer) clearTimeout(child._fadeTimer);
+        origRemove(child);
+      };
+
+      function connect() {
+        const es = new EventSource('/obs-events');
+        es.onmessage = (e) => {
+          try { const d = JSON.parse(e.data); if (d.text) addSubtitle(d.text); } catch {}
+        };
+        es.onerror = () => { es.close(); setTimeout(connect, 2000); };
+      }
+      connect();
+    })();
+    </script>
+    </body>
+    </html>
+    """
+
     private static let listenPageHTML: String = """
     <!DOCTYPE html>
     <html lang="en">
