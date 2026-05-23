@@ -619,8 +619,8 @@ final class LiveAudioServer: @unchecked Sendable {
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     html, body {
       margin: 0; padding: 0;
-      background: #0a0a0a; color: #f0f0f0;
-      font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0a0a0a; color: #f8f8f8;
+      font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       min-height: 100vh; min-height: 100dvh;
     }
     body {
@@ -639,71 +639,41 @@ final class LiveAudioServer: @unchecked Sendable {
       z-index: 10;
     }
     #play {
-      flex: 0 0 auto;
-      min-width: 110px; height: 44px;
-      border-radius: 22px;
-      border: 1.5px solid #f0f0f0;
-      background: transparent; color: #f0f0f0;
-      font-size: 15px; font-weight: 600;
-      cursor: pointer;
+      flex: 0 0 auto; min-width: 110px; height: 44px;
+      border-radius: 22px; border: 1.5px solid #f8f8f8;
+      background: transparent; color: #f8f8f8;
+      font-size: 15px; font-weight: 600; cursor: pointer;
       transition: background 0.12s, color 0.12s, transform 0.04s, border-color 0.12s;
     }
     #play:active { transform: scale(0.96); }
     #play.live   { background: #2ecc40; color: #000; border-color: #2ecc40; }
     #play.behind { background: #ff851b; color: #000; border-color: #ff851b; }
     #play.error  { background: #ff4136; color: #000; border-color: #ff4136; }
-    .status {
-      display: flex; align-items: center; gap: 8px;
-      font-size: 13px; color: #999;
-      font-variant-numeric: tabular-nums;
-      flex: 1; min-width: 0;
-    }
-    .status .text {
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    }
-    .dot {
-      width: 8px; height: 8px; border-radius: 50%;
-      background: #666; flex: 0 0 auto;
-    }
+    .status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #999; flex: 1; min-width: 0; }
+    .status .text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #666; flex: 0 0 auto; }
     .dot.live   { background: #2ecc40; box-shadow: 0 0 6px rgba(46,204,64,0.7); }
     .dot.behind { background: #ff851b; }
     .dot.error  { background: #ff4136; }
-    main {
-      flex: 1; padding: 14px 16px 80px;
-      overflow-y: auto;
-    }
-    .row {
-      padding: 10px 0;
-      border-bottom: 1px solid #1a1a1a;
-      animation: fadein 0.18s ease-out;
-    }
+    main { flex: 1; padding: 14px 16px 80px; overflow-y: auto; }
+    .row { padding: 10px 0; border-bottom: 1px solid #1a1a1a; }
     .row:last-child { border-bottom: none; }
     .row .translation {
-      font-size: 17px; line-height: 1.35;
-      color: #f0f0f0;
-      word-wrap: break-word;
+      font-size: 19px; font-weight: 600; line-height: 1.35;
+      color: #f8f8f8; word-wrap: break-word;
     }
     .row .transcription {
-      font-size: 12px; line-height: 1.35;
-      color: #888;
-      margin-top: 3px;
-      word-wrap: break-word;
+      font-size: 13px; font-weight: 400; line-height: 1.35;
+      color: #aaa; margin-top: 3px; word-wrap: break-word;
     }
-    .row .meta {
-      font-size: 10px;
-      color: #555;
-      margin-top: 4px;
-      font-variant-numeric: tabular-nums;
-    }
+    .row.hypothesis .translation { color: #999; font-style: italic; font-weight: 400; }
+    .row.hypothesis .transcription { color: #666; }
     @keyframes fadein {
       from { opacity: 0; transform: translateY(4px); }
       to   { opacity: 1; transform: translateY(0); }
     }
-    .empty {
-      text-align: center; color: #555;
-      padding: 60px 16px;
-      font-size: 14px;
-    }
+    .row.finalized { animation: fadein 0.18s ease-out; }
+    .empty { text-align: center; color: #555; padding: 60px 16px; font-size: 14px; }
     audio { display: none; }
     </style>
     </head>
@@ -718,20 +688,21 @@ final class LiveAudioServer: @unchecked Sendable {
     (function () {
       const STREAM = '/live.wav';
       const EVENTS = '/events';
-      const MAX_LATENCY = 3.0;   // seconds before we resync the audio
-      const audio  = document.getElementById('audio');
-      const btn    = document.getElementById('play');
-      const dot    = document.getElementById('dot');
-      const txt    = document.getElementById('text');
-      const list   = document.getElementById('list');
-      let mode = 'idle';   // idle | connecting | live | behind | error
+      const MAX_LATENCY = 3.0;
+      const audio = document.getElementById('audio');
+      const btn   = document.getElementById('play');
+      const dot   = document.getElementById('dot');
+      const txt   = document.getElementById('text');
+      const list  = document.getElementById('list');
+      let mode = 'idle';
+
       function setMode(m, label) {
         mode = m;
         btn.classList.remove('live','behind','error');
         dot.classList.remove('live','behind','error');
-        if (m === 'live')        { btn.textContent = 'Live';     btn.classList.add('live');   dot.classList.add('live');   }
-        else if (m === 'behind') { btn.textContent = 'Resync';   btn.classList.add('behind'); dot.classList.add('behind'); }
-        else if (m === 'error')  { btn.textContent = 'Retry';    btn.classList.add('error');  dot.classList.add('error');  }
+        if (m === 'live')        { btn.textContent = 'Live';   btn.classList.add('live');   dot.classList.add('live');   }
+        else if (m === 'behind') { btn.textContent = 'Resync'; btn.classList.add('behind'); dot.classList.add('behind'); }
+        else if (m === 'error')  { btn.textContent = 'Retry';  btn.classList.add('error');  dot.classList.add('error');  }
         else if (m === 'connecting') { btn.textContent = '…'; }
         else                     { btn.textContent = 'Listen'; }
         if (label) txt.textContent = label;
@@ -740,94 +711,112 @@ final class LiveAudioServer: @unchecked Sendable {
         setMode('connecting', 'Connecting…');
         audio.src = STREAM + '?t=' + Date.now();
         audio.load();
-        audio.play()
-          .then(() => setMode('live', 'Streaming'))
-          .catch(err => setMode('error', 'Tap to retry'));
+        audio.play().then(() => setMode('live', 'Streaming')).catch(() => setMode('error', 'Tap to retry'));
       }
       function resync() {
         try { audio.pause(); } catch (e) {}
-        audio.src = '';
-        start();
+        audio.src = ''; start();
       }
       btn.addEventListener('click', () => {
-        if (mode === 'live')         { audio.pause(); setMode('idle', 'Paused'); }
-        else if (mode === 'behind')  { resync(); }
-        else                         { start(); }
+        if (mode === 'live')        { audio.pause(); setMode('idle', 'Paused'); }
+        else if (mode === 'behind') { resync(); }
+        else                        { start(); }
       });
-      // Drift watcher: when buffered.end runs ahead of currentTime, jump
-      // forward; if even that doesn't catch up, hard-resync the stream.
       setInterval(() => {
         if (mode !== 'live') return;
-        const b = audio.buffered;
-        if (!b.length) return;
-        const end = b.end(b.length - 1);
-        const lag = end - audio.currentTime;
+        const b = audio.buffered; if (!b.length) return;
+        const end = b.end(b.length - 1); const lag = end - audio.currentTime;
         if (lag > MAX_LATENCY) {
           try { audio.currentTime = end - 0.1; } catch (e) {}
-          if (audio.buffered.length && audio.buffered.end(audio.buffered.length - 1) - audio.currentTime > MAX_LATENCY) {
-            resync();
-            return;
-          }
+          if (audio.buffered.length && audio.buffered.end(audio.buffered.length - 1) - audio.currentTime > MAX_LATENCY) { resync(); return; }
         }
         txt.textContent = 'Streaming · ' + lag.toFixed(1) + 's';
       }, 500);
-      audio.addEventListener('error',  () => { if (mode === 'live') setMode('error', 'Audio error'); });
-      audio.addEventListener('ended',  () => { if (mode === 'live') { setMode('error', 'Disconnected'); setTimeout(resync, 600); } });
-      audio.addEventListener('stalled',() => { if (mode === 'live') setMode('behind', 'Stalled'); });
-      document.addEventListener('visibilitychange', () => {
-        if (!document.hidden && mode === 'live') resync();
-      });
-      // Wake lock keeps the screen on while playing. Best-effort.
+      audio.addEventListener('error',   () => { if (mode === 'live') setMode('error', 'Audio error'); });
+      audio.addEventListener('ended',   () => { if (mode === 'live') { setMode('error', 'Disconnected'); setTimeout(resync, 600); } });
+      audio.addEventListener('stalled', () => { if (mode === 'live') setMode('behind', 'Stalled'); });
+      document.addEventListener('visibilitychange', () => { if (!document.hidden && mode === 'live') resync(); });
       let wake = null;
-      audio.addEventListener('playing', async () => {
-        if ('wakeLock' in navigator) {
-          try { wake = await navigator.wakeLock.request('screen'); } catch (e) {}
-        }
-      });
+      audio.addEventListener('playing', async () => { if ('wakeLock' in navigator) try { wake = await navigator.wakeLock.request('screen'); } catch (e) {} });
       audio.addEventListener('pause',   () => { if (wake) { wake.release(); wake = null; } });
-      // Transcript via SSE. EventSource handles reconnect automatically;
-      // the server replays the session so far on each new connection,
-      // so a brief drop won't lose context. Renders only finalized
-      // sentences — no partials, no flicker.
-      //
-      // DOM cap: at most MAX_ROWS rows are kept attached. Long sessions
-      // would otherwise grow unbounded — by hour 4 of a meeting that's
-      // a few thousand nodes, which is where mobile Safari starts to
-      // jank. Matches the server's replay cap so reconnect dedup still
-      // works (every event in the replay was seen on the live channel).
+
       const MAX_ROWS = 200;
       const seen = new Set();
-      function fmtTime(iso) {
-        try { return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
-        catch (e) { return ''; }
+      const hypothesisRows = new Map(); // chunkUUID → div
+
+      function scrollToBottom() {
+        const nearBottom = window.scrollY + window.innerHeight >= document.body.scrollHeight - 160;
+        if (nearBottom) window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
       }
-      function trimRows(userIsNearBottom) {
-        while (list.children.length > MAX_ROWS) {
-          const oldest = list.firstElementChild;
-          if (!oldest) break;
-          const removedHeight = oldest.offsetHeight;
-          if (oldest.dataset && oldest.dataset.key) {
-            seen.delete(oldest.dataset.key);
-          }
-          list.removeChild(oldest);
-          // If the user is reading history (scrolled up), keep their
-          // viewport stable by shifting the scroll up by the height
-          // of the row we just removed. If they're at the live edge
-          // we let the bottom stay at the bottom.
-          if (!userIsNearBottom) {
-            window.scrollBy(0, -removedHeight);
-          }
+
+      function trimRows() {
+        const rows = [...list.querySelectorAll('.row.finalized')];
+        while (rows.length > MAX_ROWS) {
+          const old = rows.shift();
+          if (old.dataset.key) seen.delete(old.dataset.key);
+          old.remove();
         }
       }
-      function addRow(rec) {
+
+      function stateLabel(s) {
+        if (s === 'listening')   return 'listening…';
+        if (s === 'partial')     return 'transcribing…';
+        if (s === 'translating') return 'translating…';
+        return s + '…';
+      }
+
+      function onHypothesis(d) {
+        const empty = list.querySelector('.empty');
+        if (empty) empty.remove();
+        let row = hypothesisRows.get(d.id);
+        if (!row) {
+          row = document.createElement('div');
+          row.className = 'row hypothesis';
+          list.appendChild(row);
+          hypothesisRows.set(d.id, row);
+        }
+        let tDiv = row.querySelector('.translation');
+        if (!tDiv) { tDiv = document.createElement('div'); tDiv.className = 'translation'; row.appendChild(tDiv); }
+        // Primary: translation when available, otherwise transcription, otherwise state label.
+        tDiv.textContent = (d.translation && d.translation.length > 0) ? d.translation
+                         : (d.text && d.text.length > 0) ? d.text
+                         : stateLabel(d.state);
+        // Caption: transcription when we're showing a translation.
+        let sDiv = row.querySelector('.transcription');
+        if (d.translation && d.text && d.translation !== d.text) {
+          if (!sDiv) { sDiv = document.createElement('div'); sDiv.className = 'transcription'; row.appendChild(sDiv); }
+          sDiv.textContent = d.text;
+        } else if (sDiv) {
+          sDiv.remove();
+        }
+        scrollToBottom();
+      }
+
+      function onHypothesisDone(d) {
+        const row = hypothesisRows.get(d.id);
+        if (row) {
+          row.classList.remove('hypothesis');
+          row.classList.add('finalized');
+          hypothesisRows.delete(d.id);
+        }
+      }
+
+      function onFinalized(rec) {
         const key = (rec.start || '') + '|' + (rec.end || '') + '|' + (rec.transcription || '');
         if (seen.has(key)) return;
         seen.add(key);
         const empty = list.querySelector('.empty');
         if (empty) empty.remove();
-        const row = document.createElement('div');
-        row.className = 'row';
+        // Reuse the upgraded hypothesis row (hypothesis-done already fired and removed the class).
+        // Find a finalized row without a key yet (just upgraded).
+        let row = [...list.querySelectorAll('.row.finalized')].find(r => !r.dataset.key);
+        if (!row) {
+          row = document.createElement('div');
+          row.className = 'row finalized';
+          list.appendChild(row);
+        }
         row.dataset.key = key;
+        row.innerHTML = '';
         const t = document.createElement('div');
         t.className = 'translation';
         t.textContent = rec.translation || rec.transcription || '';
@@ -838,23 +827,17 @@ final class LiveAudioServer: @unchecked Sendable {
           s.textContent = rec.transcription;
           row.appendChild(s);
         }
-        const m = document.createElement('div');
-        m.className = 'meta';
-        m.textContent = fmtTime(rec.start) + ' · ' + (rec.source || '');
-        row.appendChild(m);
-        list.appendChild(row);
-        const nearBottom = window.scrollY + window.innerHeight >= document.body.scrollHeight - 120;
-        trimRows(nearBottom);
-        if (nearBottom) window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+        if (row.parentElement !== list) list.appendChild(row);
+        trimRows();
+        scrollToBottom();
       }
+
       function connectEvents() {
         const es = new EventSource(EVENTS);
-        es.onmessage = (e) => {
-          try { addRow(JSON.parse(e.data)); } catch (err) { /* ignore */ }
-        };
-        es.onerror = () => {
-          // EventSource auto-retries; nothing to do.
-        };
+        es.onmessage = (e) => { try { onFinalized(JSON.parse(e.data)); } catch {} };
+        es.addEventListener('hypothesis', (e) => { try { onHypothesis(JSON.parse(e.data)); } catch {} });
+        es.addEventListener('hypothesis-done', (e) => { try { onHypothesisDone(JSON.parse(e.data)); } catch {} });
+        es.onerror = () => { es.close(); setTimeout(connectEvents, 2000); };
       }
       connectEvents();
     })();
