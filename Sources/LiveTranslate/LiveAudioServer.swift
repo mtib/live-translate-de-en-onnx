@@ -767,6 +767,10 @@ final class LiveAudioServer: @unchecked Sendable {
 
       function onHypothesis(d) {
         const empty = list.querySelector('.empty');
+        // Don't create a row until there's something to show — avoids blank gaps
+        // during the 'listening' state when both mic and system fire simultaneously.
+        const hasContent = (d.translation && d.translation.length > 0) || (d.text && d.text.length > 0);
+        if (!hasContent) return;
         if (empty) empty.remove();
         let row = hypothesisRows.get(d.id);
         if (!row) {
