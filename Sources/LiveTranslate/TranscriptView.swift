@@ -307,8 +307,8 @@ struct TranscriptView: View {
                 LazyVStack(alignment: .leading, spacing: compact ? 6 : 8) {
                     ForEach(displayRows) { row in
                         Group {
-                            if case .sentence(let s) = row, settings.layoutMode == .sideBySide {
-                                SideBySideSentenceRow(sentence: s)
+                            if settings.layoutMode == .sideBySide {
+                                SideBySideRow(row: row)
                             } else {
                                 TranscriptRow(row: row, compact: compact)
                             }
@@ -487,27 +487,66 @@ struct TranscriptRow: View {
     }
 }
 
-/// Side-by-side layout for completed sentences: transcript on the left,
-/// translation on the right. Only rendered when `settings.layoutMode == .sideBySide`.
-struct SideBySideSentenceRow: View {
-    let sentence: Sentence
+/// Side-by-side layout for all rows: transcript on the left, translation on the right.
+/// Handles both completed sentences and inflight chunks so the layout stays stable
+/// through the entire lifecycle — no jump from mixed to side-by-side on finalization.
+struct SideBySideRow: View {
+    let row: DisplayRow
     @EnvironmentObject var settings: AppSettings
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Text(sentence.text)
+        HStack(alignment: .top, spacing: 16) {
+            Text(leftText)
                 .font(.system(size: settings.transcriptFontSize))
-                .foregroundStyle(settings.transcriptColor)
+                .foregroundStyle(isPlaceholder ? AnyShapeStyle(settings.transcriptColor.opacity(0.5)) : AnyShapeStyle(settings.transcriptColor))
+                .italic(isPlaceholder)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
-            Divider()
-            Text(sentence.translation.isEmpty ? sentence.text : sentence.translation)
+                .contentTransition(.opacity)
+            Text(rightText)
                 .font(.system(size: settings.translationFontSize))
-                .foregroundStyle(settings.translationColor)
+                .foregroundStyle(isPlaceholder ? AnyShapeStyle(settings.translationColor.opacity(0.5)) : AnyShapeStyle(settings.translationColor))
+                .italic(isPlaceholder)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
+                .contentTransition(.opacity)
         }
         .padding(.vertical, 4)
+    }
+
+    private var isPlaceholder: Bool {
+        switch row {
+        case .sentence: return false
+        case .inflight(let c):
+            switch c.state {
+            case .partial(_, let t): return t == nil
+            default: return true
+            }
+        }
+    }
+
+    private var leftText: String {
+        switch row {
+        case .sentence(let s): return s.text
+        case .inflight(let c):
+            switch c.state {
+            case .listening:                           return "listening…"
+            case .partial(let text, _):               return text
+            case .translating(let text):              return text
+            }
+        }
+    }
+
+    private var rightText: String {
+        switch row {
+        case .sentence(let s): return s.translation.isEmpty ? s.text : s.translation
+        case .inflight(let c):
+            switch c.state {
+            case .listening:                           return "…"
+            case .partial(_, let translation):        return translation ?? "…"
+            case .translating:                        return "translating…"
+            }
+        }
     }
 }
 
