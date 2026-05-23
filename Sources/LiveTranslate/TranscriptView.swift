@@ -188,7 +188,7 @@ struct TranscriptView: View {
     @State private var streamShareShown: Bool = false
     @ViewBuilder
     private var streamShareButton: some View {
-        if let url = pipeline.liveStreamURL {
+        if pipeline.liveStreamURL != nil || pipeline.liveOBSURL != nil {
             Button {
                 streamShareShown.toggle()
             } label: {
@@ -202,9 +202,12 @@ struct TranscriptView: View {
             .buttonStyle(.plain)
             .help(pipeline.ttsActive ? "Live audio stream — listener connected" : "Live translated-audio stream")
             .popover(isPresented: $streamShareShown, arrowEdge: .bottom) {
-                StreamShareView(url: url)
-                    .padding(16)
-                    .frame(width: 240)
+                StreamShareView(
+                    url: pipeline.liveStreamURL ?? pipeline.liveOBSURL ?? "",
+                    obsURL: pipeline.liveOBSURL
+                )
+                .padding(16)
+                .frame(width: 240)
             }
         }
     }
@@ -508,48 +511,47 @@ struct SideBySideSentenceRow: View {
     }
 }
 
-/// Popover content for the stream share icon. Renders the URL as
-/// selectable text (with a copy button) and a QR code generated via
-/// CoreImage's `CIQRCodeGenerator`. The QR is regenerated each time
-/// the URL changes — cheap, no caching needed for a 240×240 image.
+/// Popover content for the stream share icon. Renders the audio stream URL
+/// (with copy button and QR code) and, if available, an OBS Browser Source URL.
 struct StreamShareView: View {
     let url: String
+    var obsURL: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Live translated audio")
                 .font(.headline)
-            Text("Open this URL on a phone with headphones to hear translations in near-real time.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text("Open on a phone with headphones to hear translations in near-real time.")
+                .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: 6) {
-                Text(url)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Button {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(url, forType: .string)
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                        .font(.system(size: 11))
-                }
-                .buttonStyle(.borderless)
-                .help("Copy URL")
-            }
+            urlRow(url)
             if let img = qrImage(for: url) {
-                Image(nsImage: img)
-                    .interpolation(.none)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 200, height: 200)
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 2)
+                Image(nsImage: img).interpolation(.none).resizable().scaledToFit()
+                    .frame(width: 200, height: 200).frame(maxWidth: .infinity).padding(.top, 2)
             }
+            if let obsURL {
+                Divider()
+                Text("OBS Browser Source")
+                    .font(.headline)
+                Text("Add as Browser Source in OBS. Set dimensions to your overlay size (e.g. 1920×1080).")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                urlRow(obsURL)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func urlRow(_ u: String) -> some View {
+        HStack(spacing: 6) {
+            Text(u).font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button {
+                let pb = NSPasteboard.general; pb.clearContents()
+                pb.setString(u, forType: .string)
+            } label: { Image(systemName: "doc.on.doc").font(.system(size: 11)) }
+            .buttonStyle(.borderless).help("Copy URL")
         }
     }
 

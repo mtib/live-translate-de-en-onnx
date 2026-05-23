@@ -95,7 +95,7 @@ struct MenuBarView: View {
     @State private var streamShareShown = false
     @ViewBuilder
     private var streamShareButton: some View {
-        if let url = pipeline.liveStreamURL {
+        if pipeline.liveStreamURL != nil || pipeline.liveOBSURL != nil {
             Button { streamShareShown.toggle() } label: {
                 Image(systemName: "dot.radiowaves.left.and.right")
                     .font(.system(size: 12, weight: .medium))
@@ -107,7 +107,11 @@ struct MenuBarView: View {
             .buttonStyle(.plain)
             .help(pipeline.ttsActive ? "Live audio stream — listener connected" : "Live translated-audio stream")
             .popover(isPresented: $streamShareShown, arrowEdge: .bottom) {
-                StreamShareView(url: url).padding(16).frame(width: 240)
+                StreamShareView(
+                    url: pipeline.liveStreamURL ?? pipeline.liveOBSURL ?? "",
+                    obsURL: pipeline.liveOBSURL
+                )
+                .padding(16).frame(width: 240)
             }
         }
     }
