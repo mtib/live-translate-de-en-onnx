@@ -759,7 +759,7 @@ final class LiveAudioServer: @unchecked Sendable {
       }
 
       function stateLabel(s) {
-        if (s === 'listening')   return 'listening…';
+        if (s === 'listening')   return '';
         if (s === 'partial')     return 'transcribing…';
         if (s === 'translating') return 'translating…';
         return s + '…';
