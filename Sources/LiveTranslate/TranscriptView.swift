@@ -66,6 +66,24 @@ struct TranscriptView: View {
             defer { holder.finish() }
             for await _ in parked { }
         }
+        .translationTask(
+            TranslationSession.Configuration(
+                source: Locale.Language(identifier: "en"),
+                target: Locale.Language(identifier: "de")
+            )
+        ) { session in
+            pipeline.installOBSTranslationSession(session)
+            defer { pipeline.installOBSTranslationSession(nil) }
+            do {
+                try await session.prepareTranslation()
+                Log.line("OBS en→de translation prepared")
+            } catch {
+                Log.line("OBS prepareTranslation failed: \(error.localizedDescription)")
+            }
+            let (parked, holder) = AsyncStream<Never>.makeStream()
+            defer { holder.finish() }
+            for await _ in parked { }
+        }
     }
 
     @ViewBuilder

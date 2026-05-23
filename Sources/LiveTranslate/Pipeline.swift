@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Combine
+import NaturalLanguage
 import ScreenCaptureKit
 import Translation
 
@@ -127,6 +128,10 @@ final class Pipeline: ObservableObject {
     private let systemSource: AudioSource
     private let transcriber: Transcriber
     private let translator: Translator
+
+    /// Second translator, always en→de, for the OBS overlay. Session installed
+    /// by TranscriptView's second `.translationTask`.
+    private let obsTranslator = AppleTranslator()
 
     // MARK: - Internal state
 
@@ -385,6 +390,24 @@ final class Pipeline: ObservableObject {
             ttsSpeaker?.enqueue(translation)
         }
         enforceMaxCount()
+
+        // OBS overlay: detect if the transcription is English and push German subtitle.
+        if let server = liveAudioServer {
+            let recognizer = NLLanguageRecognizer()
+            recognizer.processString(text)
+            if recognizer.dominantLanguage == NLLanguage.english {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    do {
+                        let german = try await self.obsTranslator.translate(text)
+                        server.publishOBSSubtitle(text: german)
+                        Log.line("OBS: published German subtitle \"\(german.prefix(40))\"")
+                    } catch {
+                        Log.line("OBS translator error: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
     }
 
     /// Write a freshly-graduated sentence to disk (shared JSONL +
@@ -559,6 +582,12 @@ final class Pipeline: ObservableObject {
     /// `TranslationSession`. Hides the AppleTranslator downcast.
     func installTranslationSession(_ session: TranslationSession?) {
         (translator as? AppleTranslator)?.setSession(session)
+    }
+
+    /// Called from TranscriptView's second `.translationTask` (en→de) to
+    /// hand the OBS overlay translator its session.
+    func installOBSTranslationSession(_ session: TranslationSession?) {
+        obsTranslator.setSession(session)
     }
 
     /// Block until queued writes hit disk. Sentences are already
