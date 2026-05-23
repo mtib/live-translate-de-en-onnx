@@ -7,8 +7,10 @@ import ScreenCaptureKit
 /// is identical between the floating overlay and the popover.
 struct MenuBarView: View {
     @ObservedObject var pipeline: Pipeline
+    @ObservedObject var settings: AppSettings
     @Binding var isWindowVisible: Bool
     let mainWindow: NSWindow?
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -45,6 +47,7 @@ struct MenuBarView: View {
             aiToggleButton
             ScreenPickButton(pipeline: pipeline)
             streamShareButton
+            settingsButton
             overlayToggleButton
         }
         .animation(.easeInOut(duration: 0.2), value: pipeline.transcriptSummary?.topic)
@@ -92,7 +95,7 @@ struct MenuBarView: View {
     @State private var streamShareShown = false
     @ViewBuilder
     private var streamShareButton: some View {
-        if let url = pipeline.liveStreamURL {
+        if pipeline.liveStreamURL != nil || pipeline.liveOBSURL != nil {
             Button { streamShareShown.toggle() } label: {
                 Image(systemName: "dot.radiowaves.left.and.right")
                     .font(.system(size: 12, weight: .medium))
@@ -104,9 +107,23 @@ struct MenuBarView: View {
             .buttonStyle(.plain)
             .help(pipeline.ttsActive ? "Live audio stream — listener connected" : "Live translated-audio stream")
             .popover(isPresented: $streamShareShown, arrowEdge: .bottom) {
-                StreamShareView(url: url).padding(16).frame(width: 240)
+                StreamShareView(
+                    url: pipeline.liveStreamURL ?? pipeline.liveOBSURL ?? "",
+                    obsURL: pipeline.liveOBSURL
+                )
+                .padding(16).frame(width: 240)
             }
         }
+    }
+
+    private var settingsButton: some View {
+        Button { openSettings() } label: {
+            Image(systemName: "gearshape")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .help("Open settings (⌘,)")
     }
 
     private var overlayToggleButton: some View {

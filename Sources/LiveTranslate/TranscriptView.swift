@@ -23,6 +23,7 @@ import CoreImage.CIFilterBuiltins
 struct TranscriptView: View {
     @ObservedObject var pipeline: Pipeline
     @AppStorage("compactMode") private var compactMode: Bool = false
+    @EnvironmentObject var settings: AppSettings
 
     private var translationConfig: TranslationSession.Configuration {
         TranslationSession.Configuration(
@@ -39,7 +40,7 @@ struct TranscriptView: View {
             // `windowBackgroundColor` would give. 0.7 opacity keeps
             // the overlay see-through over content behind it.
             Color(nsColor: .textBackgroundColor)
-                .opacity(0.7)
+                .opacity(settings.windowOpacity)
                 .ignoresSafeArea()
             content
         }
@@ -60,6 +61,24 @@ struct TranscriptView: View {
                 Log.line("Translation prepared")
             } catch {
                 Log.line("prepareTranslation failed: \(error.localizedDescription)")
+            }
+            let (parked, holder) = AsyncStream<Never>.makeStream()
+            defer { holder.finish() }
+            for await _ in parked { }
+        }
+        .translationTask(
+            TranslationSession.Configuration(
+                source: Locale.Language(identifier: "en"),
+                target: Locale.Language(identifier: "de")
+            )
+        ) { session in
+            pipeline.installOBSTranslationSession(session)
+            defer { pipeline.installOBSTranslationSession(nil) }
+            do {
+                try await session.prepareTranslation()
+                Log.line("OBS en→de translation prepared")
+            } catch {
+                Log.line("OBS prepareTranslation failed: \(error.localizedDescription)")
             }
             let (parked, holder) = AsyncStream<Never>.makeStream()
             defer { holder.finish() }
@@ -169,7 +188,7 @@ struct TranscriptView: View {
     @State private var streamShareShown: Bool = false
     @ViewBuilder
     private var streamShareButton: some View {
-        if let url = pipeline.liveStreamURL {
+        if pipeline.liveStreamURL != nil || pipeline.liveOBSURL != nil {
             Button {
                 streamShareShown.toggle()
             } label: {
@@ -183,9 +202,12 @@ struct TranscriptView: View {
             .buttonStyle(.plain)
             .help(pipeline.ttsActive ? "Live audio stream — listener connected" : "Live translated-audio stream")
             .popover(isPresented: $streamShareShown, arrowEdge: .bottom) {
-                StreamShareView(url: url)
-                    .padding(16)
-                    .frame(width: 240)
+                StreamShareView(
+                    url: pipeline.liveStreamURL ?? pipeline.liveOBSURL ?? "",
+                    obsURL: pipeline.liveOBSURL
+                )
+                .padding(16)
+                .frame(width: 240)
             }
         }
     }
@@ -284,9 +306,15 @@ struct TranscriptView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: compact ? 6 : 8) {
                     ForEach(displayRows) { row in
-                        TranscriptRow(row: row, compact: compact)
-                            .id(row.id)
-                            .transition(.opacity)
+                        Group {
+                            if settings.layoutMode == .sideBySide {
+                                SideBySideRow(row: row)
+                            } else {
+                                TranscriptRow(row: row, compact: compact)
+                            }
+                        }
+                        .id(row.id)
+                        .transition(.opacity)
                     }
                     Color.clear.frame(height: 1).id("BOTTOM")
                 }
@@ -381,6 +409,7 @@ enum DisplayRow: Identifiable, Equatable {
 struct TranscriptRow: View {
     let row: DisplayRow
     let compact: Bool
+    @EnvironmentObject var settings: AppSettings
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -390,16 +419,18 @@ struct TranscriptRow: View {
                 .frame(width: 14, alignment: .center)
             VStack(alignment: .leading, spacing: 1) {
                 Text(primaryText)
-                    .font(compact ? .callout : .body)
+                    .font(compact ? .callout : .system(size: isPlaceholder ? settings.transcriptFontSize : settings.translationFontSize))
                     .italic(isPlaceholder)
-                    .foregroundStyle(isPlaceholder ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+                    .foregroundStyle(isPlaceholder
+                        ? AnyShapeStyle(settings.transcriptColor.opacity(0.6))
+                        : AnyShapeStyle(settings.translationColor))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
                     .contentTransition(.opacity)
                 if !compact, let cap = captionText {
                     Text(cap)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: settings.transcriptFontSize))
+                        .foregroundStyle(settings.transcriptColor)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
                         .contentTransition(.opacity)
@@ -456,48 +487,110 @@ struct TranscriptRow: View {
     }
 }
 
-/// Popover content for the stream share icon. Renders the URL as
-/// selectable text (with a copy button) and a QR code generated via
-/// CoreImage's `CIQRCodeGenerator`. The QR is regenerated each time
-/// the URL changes — cheap, no caching needed for a 240×240 image.
+/// Side-by-side layout for all rows: transcript on the left, translation on the right.
+/// Handles both completed sentences and inflight chunks so the layout stays stable
+/// through the entire lifecycle — no jump from mixed to side-by-side on finalization.
+struct SideBySideRow: View {
+    let row: DisplayRow
+    @EnvironmentObject var settings: AppSettings
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 16) {
+            Text(leftText)
+                .font(.system(size: settings.transcriptFontSize))
+                .foregroundStyle(isPlaceholder ? AnyShapeStyle(settings.transcriptColor.opacity(0.5)) : AnyShapeStyle(settings.transcriptColor))
+                .italic(isPlaceholder)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+                .contentTransition(.opacity)
+            Text(rightText)
+                .font(.system(size: settings.translationFontSize))
+                .foregroundStyle(isPlaceholder ? AnyShapeStyle(settings.translationColor.opacity(0.5)) : AnyShapeStyle(settings.translationColor))
+                .italic(isPlaceholder)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+                .contentTransition(.opacity)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var isPlaceholder: Bool {
+        switch row {
+        case .sentence: return false
+        case .inflight(let c):
+            switch c.state {
+            case .partial(_, let t): return t == nil
+            default: return true
+            }
+        }
+    }
+
+    private var leftText: String {
+        switch row {
+        case .sentence(let s): return s.text
+        case .inflight(let c):
+            switch c.state {
+            case .listening:                           return "listening…"
+            case .partial(let text, _):               return text
+            case .translating(let text):              return text
+            }
+        }
+    }
+
+    private var rightText: String {
+        switch row {
+        case .sentence(let s): return s.translation.isEmpty ? s.text : s.translation
+        case .inflight(let c):
+            switch c.state {
+            case .listening:                           return "…"
+            case .partial(_, let translation):        return translation ?? "…"
+            case .translating:                        return "translating…"
+            }
+        }
+    }
+}
+
+/// Popover content for the stream share icon. Renders the audio stream URL
+/// (with copy button and QR code) and, if available, an OBS Browser Source URL.
 struct StreamShareView: View {
     let url: String
+    var obsURL: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Live translated audio")
                 .font(.headline)
-            Text("Open this URL on a phone with headphones to hear translations in near-real time.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text("Open on a phone with headphones to hear translations in near-real time.")
+                .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: 6) {
-                Text(url)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Button {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(url, forType: .string)
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                        .font(.system(size: 11))
-                }
-                .buttonStyle(.borderless)
-                .help("Copy URL")
-            }
+            urlRow(url)
             if let img = qrImage(for: url) {
-                Image(nsImage: img)
-                    .interpolation(.none)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 200, height: 200)
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 2)
+                Image(nsImage: img).interpolation(.none).resizable().scaledToFit()
+                    .frame(width: 200, height: 200).frame(maxWidth: .infinity).padding(.top, 2)
             }
+            if let obsURL {
+                Divider()
+                Text("OBS Browser Source")
+                    .font(.headline)
+                Text("Add as Browser Source in OBS. Set dimensions to your overlay size (e.g. 1920×1080).")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                urlRow(obsURL)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func urlRow(_ u: String) -> some View {
+        HStack(spacing: 6) {
+            Text(u).font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled).lineLimit(1).truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button {
+                let pb = NSPasteboard.general; pb.clearContents()
+                pb.setString(u, forType: .string)
+            } label: { Image(systemName: "doc.on.doc").font(.system(size: 11)) }
+            .buttonStyle(.borderless).help("Copy URL")
         }
     }
 
