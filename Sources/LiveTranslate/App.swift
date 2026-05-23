@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct LiveTranslateApp: App {
     @StateObject private var pipeline = Pipeline()
+    @StateObject private var settings = AppSettings()
     /// Captured once by `WindowAccessor` so the menu-bar Show/Hide action
     /// can order the window in/out without going through NSApp.windows.
     @State private var mainWindow: NSWindow?
@@ -25,12 +26,16 @@ struct LiveTranslateApp: App {
     var body: some Scene {
         Window("LiveTranslate", id: "main") {
             TranscriptView(pipeline: pipeline)
+                .environmentObject(settings)
                 .frame(minWidth: 260, minHeight: 80)
                 .background(WindowAccessor { window in
                     mainWindow = window
                     configure(window)
                 })
                 .onAppear { installTerminateHook(pipeline: pipeline) }
+                .onChange(of: settings.windowOpacity) { _, opacity in
+                    mainWindow?.alphaValue = CGFloat(opacity)
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentMinSize)
@@ -51,14 +56,20 @@ struct LiveTranslateApp: App {
             }
         }
 
+        Settings {
+            OptionsView(settings: settings)
+        }
+
         // Status-bar icon. Clicking shows the compact transcript popover.
         // Icon fills while recording so state is visible at a glance.
         MenuBarExtra {
             MenuBarView(
                 pipeline: pipeline,
+                settings: settings,
                 isWindowVisible: $isWindowVisible,
                 mainWindow: mainWindow
             )
+            .environmentObject(settings)
         } label: {
             // Matches the app icon symbol. Fill signals recording in progress.
             Image(systemName: pipeline.isRunning

@@ -23,6 +23,7 @@ import CoreImage.CIFilterBuiltins
 struct TranscriptView: View {
     @ObservedObject var pipeline: Pipeline
     @AppStorage("compactMode") private var compactMode: Bool = false
+    @EnvironmentObject var settings: AppSettings
 
     private var translationConfig: TranslationSession.Configuration {
         TranslationSession.Configuration(
@@ -39,7 +40,7 @@ struct TranscriptView: View {
             // `windowBackgroundColor` would give. 0.7 opacity keeps
             // the overlay see-through over content behind it.
             Color(nsColor: .textBackgroundColor)
-                .opacity(0.7)
+                .opacity(settings.windowOpacity)
                 .ignoresSafeArea()
             content
         }
@@ -284,9 +285,15 @@ struct TranscriptView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: compact ? 6 : 8) {
                     ForEach(displayRows) { row in
-                        TranscriptRow(row: row, compact: compact)
-                            .id(row.id)
-                            .transition(.opacity)
+                        Group {
+                            if case .sentence(let s) = row, settings.layoutMode == .sideBySide {
+                                SideBySideSentenceRow(sentence: s)
+                            } else {
+                                TranscriptRow(row: row, compact: compact)
+                            }
+                        }
+                        .id(row.id)
+                        .transition(.opacity)
                     }
                     Color.clear.frame(height: 1).id("BOTTOM")
                 }
@@ -381,6 +388,7 @@ enum DisplayRow: Identifiable, Equatable {
 struct TranscriptRow: View {
     let row: DisplayRow
     let compact: Bool
+    @EnvironmentObject var settings: AppSettings
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -390,16 +398,18 @@ struct TranscriptRow: View {
                 .frame(width: 14, alignment: .center)
             VStack(alignment: .leading, spacing: 1) {
                 Text(primaryText)
-                    .font(compact ? .callout : .body)
+                    .font(compact ? .callout : .system(size: isPlaceholder ? settings.transcriptFontSize : settings.translationFontSize))
                     .italic(isPlaceholder)
-                    .foregroundStyle(isPlaceholder ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+                    .foregroundStyle(isPlaceholder
+                        ? AnyShapeStyle(settings.transcriptColor.opacity(0.6))
+                        : AnyShapeStyle(settings.translationColor))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
                     .contentTransition(.opacity)
                 if !compact, let cap = captionText {
                     Text(cap)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: settings.transcriptFontSize))
+                        .foregroundStyle(settings.transcriptColor)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
                         .contentTransition(.opacity)
@@ -453,6 +463,30 @@ struct TranscriptRow: View {
             default:                                    return nil
             }
         }
+    }
+}
+
+/// Side-by-side layout for completed sentences: transcript on the left,
+/// translation on the right. Only rendered when `settings.layoutMode == .sideBySide`.
+struct SideBySideSentenceRow: View {
+    let sentence: Sentence
+    @EnvironmentObject var settings: AppSettings
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text(sentence.text)
+                .font(.system(size: settings.transcriptFontSize))
+                .foregroundStyle(settings.transcriptColor)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+            Divider()
+            Text(sentence.translation.isEmpty ? sentence.text : sentence.translation)
+                .font(.system(size: settings.translationFontSize))
+                .foregroundStyle(settings.translationColor)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+        }
+        .padding(.vertical, 4)
     }
 }
 
