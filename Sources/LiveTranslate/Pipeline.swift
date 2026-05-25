@@ -308,9 +308,12 @@ final class Pipeline: ObservableObject {
                 inflightChunks[idx].state = .partial(text: text, translation: text)
                 return
             }
-            // Throttle: at most one dispatch per second per chunk.
+            // Throttle: at most ~3 dispatches/s per chunk. Apple's on-device
+            // translation comfortably handles 100–200 ms/sentence on M-series;
+            // 1 s was overly conservative and added meaningful latency to the
+            // rolling preview text.
             let now = Date()
-            guard now.timeIntervalSince(partialTranslationTimers[id] ?? .distantPast) >= 1.0 else { return }
+            guard now.timeIntervalSince(partialTranslationTimers[id] ?? .distantPast) >= 0.3 else { return }
             partialTranslationTimers[id] = now
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -323,9 +326,9 @@ final class Pipeline: ObservableObject {
             }
 
         case .completed(let text, let startSeconds, let endSeconds):
-            // Whisper produced text. Either graduate immediately (no
-            // translation needed / cached) or flip to "translating"
-            // and dispatch the translator.
+            // ASR fired endpoint with final text for this chunk. Either
+            // graduate immediately (src == tgt / cache hit) or flip the
+            // row to "translating" and dispatch the translator.
             let createdAt = startSeconds.map { runStartedAt.addingTimeInterval($0) } ?? Date()
             let endedAt = endSeconds.map { runStartedAt.addingTimeInterval($0) } ?? createdAt
             let srcLang = String(self.source.identifier.prefix(2))
