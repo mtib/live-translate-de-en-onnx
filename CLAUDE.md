@@ -61,7 +61,6 @@ Idempotent — skips anything already present. Downloads:
 | Artifact | Source | Destination |
 |---|---|---|
 | `libsherpa-onnx-c-api.dylib` + `libonnxruntime.1.24.4.dylib` | `sherpa-onnx-v1.13.2-osx-arm64-shared.tar.bz2` from `k2-fsa/sherpa-onnx` v1.13.2 | `external/sherpa-onnx/lib/` |
-| `silero_vad.onnx` | `asr-models/silero_vad.onnx` from sherpa-onnx releases | `build/sherpa-models/` |
 | `sherpa-onnx-streaming-zipformer-de-kroko-2025-08-06/` | `asr-models/<name>.tar.bz2` | `build/sherpa-models/<dir>/` |
 | `kitten-mini-en-v0_8/` | `tts-models/kitten-mini-en-v0_8.tar.bz2` | `build/sherpa-models/<dir>/` |
 
@@ -80,14 +79,18 @@ The kitten-mini directory contains: `model.onnx`, `voices.bin`, `tokens.txt`, an
 6. `install_name_tool -add_rpath @executable_path/../Frameworks` on the binary.
 7. Copy `libsherpa-onnx-c-api.dylib` and `libonnxruntime.1.24.4.dylib` into
    `Contents/Frameworks/`. Create unversioned symlink `libonnxruntime.dylib`.
-8. Copy `silero_vad.onnx` → `Contents/Resources/`.
-9. Copy `sherpa-onnx-streaming-zipformer-de-kroko-2025-08-06/` dir →
+8. Copy `sherpa-onnx-streaming-zipformer-de-kroko-2025-08-06/` dir →
    `Contents/Resources/`.
-10. Copy `kitten-mini-en-v0_8/` dir → `Contents/Resources/`.
-11. `./tools/make-icon.sh build/icon` + copy `icon.icns` → `Contents/Resources/`.
-12. `codesign --force --deep --sign "${SIGN_IDENTITY}"` where `SIGN_IDENTITY`
+9. Copy `kitten-mini-en-v0_8/` dir → `Contents/Resources/`.
+10. `./tools/make-icon.sh build/icon` + copy `icon.icns` → `Contents/Resources/`.
+11. `codesign --force --deep --sign "${SIGN_IDENTITY}"` where `SIGN_IDENTITY`
     defaults to `-` (ad-hoc) if `LIVETRANSLATE_SIGN_IDENTITY` is unset.
-13. Print `✓ built build/LiveTranslate.app`.
+12. Print `✓ built build/LiveTranslate.app`.
+
+Silero VAD model is no longer bundled (replaced by an energy + ZCR detector
+in Swift). `tools/download-sherpa.sh` still fetches `silero_vad.onnx` into
+`build/sherpa-models/` so any external scripts continue to find it, but the
+bundle no longer references it.
 
 ### ModelConfig.swift — compile-time language pair
 
@@ -103,7 +106,7 @@ enum ModelConfig {
     static var asrJoiner:  String { "\(asrModelDir)/joiner.onnx" }
     static var asrTokens:  String { "\(asrModelDir)/tokens.txt" }
 
-    static let vadModel = "silero_vad.onnx"
+    // No VAD model — energy + ZCR in SherpaTranscriber.isVoiced.
 
     static let ttsModelDir = "kitten-mini-en-v0_8"
     static var ttsModel:   String { "\(ttsModelDir)/model.onnx" }
@@ -696,6 +699,34 @@ future builds reuse the grant.
 
 ---
 
+## Latency tunings (current budget)
+
+End-to-end latency from a syllable being spoken to it being visible:
+
+| Path | Typical | Dominant |
+|---|---|---|
+| Speech → partial transcript in app | ~50–90 ms paint | Sherpa decode (CoreML on ANE) |
+| Speech → partial translation in app | +0–300 ms | `partialTranslationTimers` throttle (0.3 s) |
+| Speech → final transcript / translation | ~1.3–1.9 s | `endpointSilenceSeconds` (1.2 s) + final translate (~150 ms) |
+| Speech → OBS overlay (German for English speech) | same as final + ~100 ms | Same endpoint silence |
+
+Knobs (file:line):
+
+- `SherpaTranscriber.endpointSilenceSeconds = 1.2` — sherpa rule-1 trailing silence
+- `SherpaTranscriber.rule2SilenceSeconds = 1.8` — rule-2 max silence
+- `SherpaTranscriber.maxUtteranceSeconds = 60` — rule-3 hard cap
+- `Pipeline.applyLifecycle(.partial)` throttle gate: **0.3 s** per chunk
+- `MicrophoneSource.installTap` buffer size: **512 samples** (~10.7 ms)
+- `RNNoiseProcessor` algorithmic latency: 10 ms (one 480-sample frame)
+- TranscriptView animation: `0.09 s` on row add/remove only; text content
+  uses `.contentTransition(.identity)` (no fade) so partial growth doesn't
+  flicker
+
+Anything below those values starts cutting natural breaths or stressing the
+on-device translation cold-start path. Watch the log line
+`SherpaTranscriber: recognizer loaded (provider=coreml)` at startup — if it
+reads `provider=cpu`, ASR decode roughly doubles (lesson #23).
+
 ## Build / run / debug commands
 
 ```sh
@@ -964,3 +995,119 @@ tccutil reset ScreenCapture local.mtib.livetranslate
     a new segment that picks up immediately after the gap. The `intentionalStop` guard
     prevents a reconnect loop when the user calls `stop()` (which also triggers
     `stopCapture()` and may fire `didStopWithError`).
+
+40. **Late translation tasks after `stop()` resurrect cleared rows.** `Pipeline.run()`'s
+    `defer` clears `sentences`, `inflightChunks`, `transcriptSummary`, the translation
+    cache, etc. once finalize+zip complete. But `.completed` lifecycle events dispatch
+    `Task { @MainActor in translator.translate(...) → graduate(...) }`; if a translation
+    is in flight when the user presses Stop, it lands on `MainActor` after the clear
+    and appends a phantom Sentence into the empty UI. Same hazard for `applyLifecycle`
+    hops queued before stop. Fix: gate both `applyLifecycle` and `graduate` on
+    `isActive` — drop late events. `isActive` is set false in the `defer`, AFTER MKV
+    export + zip await, so legit completions during the finalize phase still go through.
+
+41. **Main window must render only the sentence list.** Earlier iterations put the
+    Start/Stop button, screen pick, stream share, and the AI toggle in `TranscriptView`'s
+    bars. The user moved all controls to the menu-bar popover (`MenuBarView`) and
+    Options (`OptionsView`) so the main window is a clean floating subtitle bar.
+    Re-introducing a control bar in `TranscriptView` is a regression — keep
+    `content` as `sentenceList()` + padding only. The corresponding `fullBar`,
+    `compactBar`, `primaryButton`, `streamShareButton`, `summaryBar`, `errorBanner`,
+    `aiToggleButton` were dead code by then and have been deleted.
+
+42. **`@AppStorage` inside an `ObservableObject` does NOT publish.** `@AppStorage`
+    only registers with SwiftUI's update mechanism when used directly in a `View`
+    body (via `DynamicProperty.update()`). On an `ObservableObject` it writes to
+    `UserDefaults` correctly but never sends `objectWillChange`, so views observing
+    that object via `@EnvironmentObject` / `@ObservedObject` don't re-render on
+    changes. Symptom: OptionsView slider moves and persists, but TranscriptView's
+    row font size doesn't update until something else triggers a redraw. Fix:
+    convert to `@Published var x { didSet { UserDefaults.standard.set(x, forKey: …) } }`
+    with explicit init-time load. The projected-value binding (`$settings.x`) still
+    works as expected.
+
+43. **`AVAudioEngine.setVoiceProcessingEnabled(true)` ducks system audio on macOS.**
+    Was attractive because it bundles AEC + NS + AGC in hardware (zero CPU) and
+    would let us delete RNNoise + manual AGC + the crosstalk gate on the mic.
+    Problem: it flips the audio session into a voice-chat profile that ducks
+    EVERY other audio source the user can hear — so they can't hear the system
+    audio they're capturing while recording. There is no flag to opt out. Also:
+    on macOS the input exposes 5 channels (processed mic + raw + reference
+    signals); without `converter.channelMap = [0]`, `AVAudioConverter` averages
+    all five into mono and the result is unusable. Revert path: keep RNNoise +
+    AGC + crosstalk gate on the mic in `DenoisingAudioSource`.
+
+44. **Window-level `alphaValue` for opacity also fades the text.** Setting
+    `mainWindow.alphaValue = opacity` on the NSWindow applies opacity to every
+    layer including text, making low-opacity overlay modes illegible. Fix: set
+    opacity on a ZStack background (`Color(...).opacity(settings.windowOpacity)`)
+    so only the background is translucent; text stays at full alpha. Same
+    applies to `SummaryView`.
+
+45. **`DenoisingAudioSource.start()` was not idempotent.** A second `start()`
+    while the pump task was alive spawned a duplicate iterator that
+    double-broadcast every buffer. Fix: `if pumpTask != nil { return }` guard
+    at the top of `start()`. Same defensive check belongs on any AsyncSource
+    wrapper whose lifecycle is driven externally.
+
+46. **`SherpaTranscriber` background tasks can preempt ASR via ANE contention.**
+    The `FoundationModels` `LanguageModelSession` runs on the Apple Neural Engine.
+    sherpa-onnx ASR with `provider = "coreml"` also runs on the ANE. The ANE is
+    effectively single-tenant: when the LLM generates a topic+summary (typically
+    1–3 s), ASR inference stalls for that duration and the transcript visibly
+    "catches up" once the LLM completes. Symptom the user reported: live captions
+    pause and then burst-update. Fix: gate every AI summary trigger
+    (`startSummaryLoop` in `Pipeline.swift`) on `inflightChunks.isEmpty` AND
+    ≥1.5 s of idle since the last sentence landed. The summarizer still runs
+    often (opportunistic at ≥4 s idle, periodic at 45 s) but never preempts
+    active decoding.
+
+47. **`@AppStorage` in `TranscriptView` for `compactMode` was load-bearing for
+    layout.** Was replaced by `AppSettings.LayoutMode.compact` (a third case in
+    the layout picker alongside `.mixed` and `.sideBySide`). The chevron up/down
+    buttons in the top-right of the main window that toggled `compactMode` are
+    gone. Don't reintroduce them — Options is the single layout-control surface.
+
+48. **HTTP request reads can't assume one packet.** Original `LiveAudioServer.handle`
+    used `conn.receive` once and parsed whatever arrived as the full HTTP request.
+    Behind a slow proxy or on a slow client, the request line can split across
+    packets — the parser then gave a bogus path and the connection was 404-cancelled.
+    Fix: `receiveRequest(_:accumulator:)` accumulates until `\r\n\r\n`, capped at
+    16 KB to avoid runaway.
+
+49. **SSE replay-snapshot race in `LiveAudioServer.serveEventStream`.** Original
+    code snapshotted `eventReplay` before registering the new connection in
+    `eventSubscribers`. Any `publishTranscript` / `publishSettings` that fired
+    between the snapshot and the registration was silently dropped (not in
+    replay, not delivered live). Fix: register the connection FIRST under the
+    lock, snapshot replay + settings under the same lock, then send the
+    preamble. Same pattern for `serveOBSEventStream`.
+
+50. **`jsonEscape` must escape all `<0x20` control chars.** Original implementation
+    only handled `\`, `"`, `\n`, `\r`. A control character (`\t`, `\b`, `\f`, or
+    raw `\u00XX`) in ASR text produces invalid JSON, which breaks the listen
+    page's `JSON.parse(e.data)`. Fix: explicit table for `\b`/`\f`/`\t` plus
+    `\u00XX` for everything else `<0x20`.
+
+51. **Translation row should always be ABOVE the transcript.** On the web target,
+    when a hypothesis arrives with no translation yet, only the `.transcription`
+    div is created. When the translation lands later and a fresh `.translation`
+    div is appended, it ends up BELOW the transcription. Fix: `insertBefore(tDiv,
+    row.firstChild)` instead of `appendChild`. Same row layout invariant the
+    macOS UI maintains via its VStack ordering.
+
+52. **Don't animate the row crossover from hypothesis to finalized.** The previous
+    JS did `row.classList.add('finalized')` on `hypothesis-done`, which triggered
+    the `.row.finalized { animation: fadein ... }` rule and visibly flickered the
+    row on graduation. Fix: tag the row with `data-pending="1"` on hypothesis-done
+    (no class change), then on `onFinalized` find that pending row and
+    swap-in-place. Brand-new rows that bypass the hypothesis path use a separate
+    `.row.fresh` class that triggers the fadein.
+
+53. **`.contentTransition(.opacity)` on partial-text fades through transparency.**
+    With `.animation(_, value: bodyKey)` triggering on every text mutation, each
+    partial-growth update made the Text view fade to alpha 0 and back. At any
+    duration this reads as a flicker. Fix: `.contentTransition(.identity)` for
+    in-place updates, and drop the row-level bodyKey animation. Keep
+    `.transition(.opacity)` ONLY on row add/remove (where the whole row really
+    is appearing/disappearing).
