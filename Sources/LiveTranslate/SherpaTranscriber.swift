@@ -34,13 +34,9 @@ final class SherpaTranscriber: Transcriber {
     /// Trailing-silence endpoint threshold fed to sherpa-onnx rule 1.
     /// Trailing silence after voiced speech that fires the ASR's
     /// rule-1 endpoint (sherpa-onnx commits the hypothesis and closes
-    /// the chunk). Was 1.0 s, but natural mid-sentence pauses (breath,
-    /// thinking) routinely exceed 1 s — e.g. "Wenn das passiert ist,
-    /// wird *<breath>* der Quark…" got cut into two chunks. 1.8 s
-    /// gives normal breaths headroom while still committing within
-    /// ~2 s of a real sentence end. Rule-2 (max silence regardless)
-    /// stays at 2.4 s so long pauses still terminate.
-    static let endpointSilenceSeconds: Float = 1.8
+    /// the chunk). 1.2 s tightens end-to-end latency while the semantic
+    /// suppression below still protects natural mid-sentence breaths.
+    static let endpointSilenceSeconds: Float = 1.2
 
     /// RMS used for the crosstalk gate AND the energy-based VAD.
     static let silenceRMSThreshold: Float = 0.012
@@ -60,7 +56,7 @@ final class SherpaTranscriber: Transcriber {
     /// pass to sherpa-onnx; also used by the semantic endpoint
     /// suppression below as "if silence has grown past this, commit
     /// regardless of terminal punctuation".
-    static let rule2SilenceSeconds: Float = 2.4
+    static let rule2SilenceSeconds: Float = 1.8
 
     /// Sherpa rule-3: hard cap on a single utterance regardless of trailing
     /// silence. 20 s scalpels long natural sentences with dense speech mid-
