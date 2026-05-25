@@ -24,7 +24,10 @@ Before editing any code, read **all** of `Sources/LiveTranslate/*.swift`. The da
 
 - Lifecycle events flow from `SherpaTranscriber.onChunkLifecycle` → `Pipeline.applyLifecycle`
 - UUID continuity is a shared contract between `SherpaTranscriber`, `Pipeline`, and `TranscriptView` — breaking it in any one place causes UI flicker
-- The crosstalk gate is applied in `DenoisingAudioSource` (after RNNoise, before the broadcaster) so both recorder AND transcriber see the same muted buffer
+- The crosstalk gate is applied in `DenoisingAudioSource` (after RNNoise on mic / after AGC on system, before the broadcaster) so both recorder AND transcriber see the same muted buffer
+- The main window renders ONLY the sentence list; **all controls (Start/Stop, screen pick, stream share, AI toggle) live in the menu-bar popover or the Options window** — touching `TranscriptView` for control affordances reverts that decision (see lesson #41)
+- `isActive` gates every late lifecycle/translation callback — without it, post-stop hops resurrect cleared rows (lesson #40)
+- `AppSettings` uses `@Published` (not `@AppStorage`) because `@AppStorage` inside an `ObservableObject` doesn't fire `objectWillChange` (lesson #42)
 
 Skimming or grepping for one symbol misses these patterns. Read everything, then edit.
 
@@ -131,11 +134,11 @@ missing and the app crashes on its first permission request.
 flowchart TD
     Mic[Mic] --> DenMic["DenoisingAudioSource mic\nRNNoise + AGC + crosstalk gate"]
     DenMic --> RecMic["AudioRecorder → .mic.wav\n48 kHz Int16"]
-    DenMic --> TMic["transcribe() — own ASR stream + Silero VAD\naccumulator + worker tasks"]
+    DenMic --> TMic["transcribe() — own ASR stream + energy/ZCR VAD\naccumulator + worker tasks"]
 
-    Sys[System] --> DenSys["DenoisingAudioSource system\nRNNoise + AGC"]
+    Sys[System] --> DenSys["DenoisingAudioSource system\nAGC + crosstalk gate (no RNNoise)"]
     DenSys --> RecSys["AudioRecorder → .system.wav\n48 kHz Int16"]
-    DenSys --> TSys["transcribe() — own ASR stream + Silero VAD\naccumulator + worker tasks"]
+    DenSys --> TSys["transcribe() — own ASR stream + energy/ZCR VAD\naccumulator + worker tasks"]
 
     subgraph Transcriber["SherpaTranscriber — recognizer loaded once, streams are cheap"]
         TMic
@@ -146,7 +149,7 @@ flowchart TD
     TSys -->|onChunkLifecycle| Pipe
 
     Pipe --> EL[".listening — reserve row"]
-    Pipe --> EP[".partial text — update inflight row"]
+    Pipe --> EP[".partial text — update inflight row + throttled partial translation"]
     Pipe --> EC[".completed text start end — translate — graduate()"]
     Pipe --> ED[".dropped — remove row"]
 
@@ -155,12 +158,14 @@ flowchart TD
     EC --> SRT["MergedSubtitleArchive .srt per language"]
     EC --> Server["LiveAudioServer.publishTranscript\nport 8765"]
     EC -->|"audioListenerCount > 0"| TTS["OnnxTTSSpeaker.enqueue\nkitten-mini ONNX → 24 kHz PCM16 LE"]
+    EC -->|"if NLLanguageRecognizer == .english"| OBS["obsTranslator (en→de) → publishOBSSubtitle"]
 
     TTS -->|PCM audio| Server
 
-    Server --> R1["/ — HTML listen page"]
+    Server --> R1["/ — HTML listen page (SSE settings + hypothesis)"]
     Server --> R2["/live.wav — open WAV stream"]
     Server --> R3["/events — SSE transcript"]
+    Server --> R4["/obs — OBS overlay HTML + /obs-events SSE"]
 ```
 
 ---
@@ -168,12 +173,25 @@ flowchart TD
 ## Key design decisions
 
 - **Per-stream pipelines — no shared locks, parallel execution.** Mic and system each
-  go through their own `DenoisingAudioSource` (independent RNNoise state, AGC), their
-  own `AudioRecorder`, and their own `SherpaTranscriber.transcribe()` call. Each
-  `transcribe()` creates a fresh sherpa-onnx ASR stream and Silero VAD instance on
-  the shared recognizer (recognizer is loaded once; creating a new `OnnlineStream` on
-  it is cheap). Mic and system accumulate, decode, and fire lifecycle events
-  concurrently — no lock required at the stream level.
+  go through their own `DenoisingAudioSource` (independent state) and their own
+  `SherpaTranscriber.transcribe()` call. Each `transcribe()` creates a fresh
+  sherpa-onnx ASR stream on the shared recognizer (recognizer is loaded once;
+  creating a new `OnlineStream` on it is cheap). Mic and system accumulate,
+  decode, and fire lifecycle events concurrently — no lock required at the
+  stream level.
+
+- **`DenoisingAudioSource` has per-source configuration.** `denoise` + `applyAGC`
+  flags + optional `muteWhen` crosstalk gate. Current wiring:
+  - **Mic**: `denoise=true`, `applyAGC=true`, crosstalk gate ON.
+  - **System**: `denoise=false` (SCK delivers clean app audio — RNNoise can only
+    soften transients), `applyAGC=true` (normalize loudness vs mic).
+  We do NOT use AVAudioEngine's `VoiceProcessingIO` on the mic — see lesson #43.
+
+- **No Silero VAD.** Voice activity is decided with an energy + zero-cross-rate
+  test in `SherpaTranscriber.isVoiced` (RMS ≥ `silenceRMSThreshold` AND ZCR in
+  `[minZeroCrossRate, maxZeroCrossRate]`). No ONNX inference per buffer, no
+  model load — ~hundreds of nanoseconds per 10 ms chunk. Used for chunk-onset
+  detection and the crosstalk gate's voiced-flag stamp.
 
 - **Inflight-chunk UI model with UUID continuity.** At voice onset the accumulator
   fires `.listening` with a new `UUID`. That UUID travels with the chunk through
@@ -331,7 +349,7 @@ flowchart TD
 
 - **English detection for OBS.** `NLLanguageRecognizer.dominantLanguage` is called synchronously in `graduate()` on the final English translation text. It is on-device, requires no permissions, completes in < 1 ms on sentence-length text, and produces > 99% accuracy for the German→English pair used here. The check guards the dispatch to `obsTranslator` (a second `AppleTranslator` for `en→de`). Only dispatched when `liveAudioServer != nil`. A second `.translationTask` modifier in `TranscriptView` feeds `installOBSTranslationSession(_:)`.
 
-- **AppSettings / OptionsView.** `AppSettings` is an `ObservableObject` backed entirely by `@AppStorage` so settings survive across launches without a separate persistence layer. It is injected as `.environmentObject` at the root so all views read and write it without threading concerns. `OptionsView` is the `Settings` scene body — opened by Cmd+, or the gear button in the menu-bar popover. All sliders and pickers write directly; changes are live with no Apply button. `windowOpacity` is applied in `App.swift` by observing `AppSettings` and calling `window.backgroundColor = .textBackground.withAlphaComponent(opacity)` on change.
+- **AppSettings / OptionsView.** `AppSettings` is an `ObservableObject` with `@Published` properties that persist to `UserDefaults` via `didSet`. (`@AppStorage` inside an `ObservableObject` does NOT fire `objectWillChange`, so views observing the object never re-render on writes — see lesson #42.) It is injected via `.environmentObject` at the root and read by `TranscriptView`, `MenuBarView`, `OptionsView`, `SummaryView`. `Pipeline.bindSettings(_:)` subscribes via Combine to forward changes to the web target (throttled to 200 ms). `OptionsView` is the `Settings` scene body — opened by Cmd+, or the gear button in the menu-bar popover. `windowOpacity` is applied via SwiftUI `.opacity()` on the ZStack background; no NSWindow-level alpha (which would also fade the text — lesson #44).
 
 - **Pruning.** Prune loop runs once per second in a background task. Drops sentences
   older than `maxAgeSeconds` (300 s) that aren't the last sentence (protected so the
@@ -366,8 +384,8 @@ flowchart TD
 | `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns `sentences`, `inflightChunks`, `translationCache`, `partialTranslationTimers`, `ttsSpeaker`, `liveAudioServer`, `ttsActive`, `ttsListenerCount`, `ttsModelLoaded`. Wires `onChunkLifecycle` in `init`. No persisted settings (language is compile-time). No source/target pickers. `applyLifecycle` is the state machine for all chunk events. |
 | `SourcePipeline.swift` | Per-stream pipeline. Owns `AudioRecorder`. Runs `runRecordingLoop` + `runRecognitionCycle` as concurrent async-let children. The `SessionSnapshot` stream from `transcribe()` is drained but ignored — lifecycle callbacks drive everything. |
 | `Types.swift` | `SourceLocale`, `TargetLanguage`, `SourceTag` (`.mic` / `.system`, with `iconSystemName` and `shortLabel`), `InflightChunk` (with `.listening`, `.partial(text:translation:)`, `.translating(text:)` — NO `.transcribing`), `Sentence`, `PipelineStatus`, `SessionSentence`, `SessionSnapshot`. Protocols: `AudioSource`, `Transcriber`, `Translator`. |
-| `ModelConfig.swift` | Compile-time constants: `sourceLanguage = "de"`, `targetLanguage = "en"`, `provider = "coreml"`, ASR model dir + file paths, VAD model path, TTS model dir + file paths. |
-| `SherpaTranscriber.swift` | The transcriber. Loads sherpa-onnx `OnlineRecognizer` once (`ensureRecognizerLoaded`, `NSLock`-protected). Each `transcribe()` call runs `runChunkLoop`: two structured child tasks (accumulator + worker). Accumulator: resamples 48→16 kHz (`SherpaResampler`), feeds Silero VAD + ASR recognizer, tracks `chunkStartSample`/`lastVoicedEndSample`/`committedLength`, fires lifecycle events. Worker: drains `TurnRecord` queue, drops empty/punctuation-only turns, fires `.completed`. `normalizeHypothesis` strips leading `.?! `. `sentenceBoundary` detects `. `(after letter) / `? ` / `! `. Endpoint silence: 1.8 s (rule-1), 2.4 s (rule-2), 60 s hard cap (rule-3). |
+| `ModelConfig.swift` | Compile-time constants: `sourceLanguage = "de"`, `targetLanguage = "en"`, `provider = "coreml"`, ASR model dir + file paths, TTS model dir + file paths. (No VAD model — energy + ZCR replaced Silero.) |
+| `SherpaTranscriber.swift` | The transcriber. Loads sherpa-onnx `OnlineRecognizer` once (`ensureRecognizerLoaded`, `NSLock`-protected). Each `transcribe()` call runs `runChunkLoop`: two structured child tasks (accumulator + worker). Accumulator: resamples 48→16 kHz (`SherpaResampler`), gates voicing via `isVoiced` (energy RMS + ZCR), feeds ASR recognizer, tracks `chunkStartSample`/`lastVoicedEndSample`/`committedLength`, fires lifecycle events. Worker: drains `TurnRecord` queue, drops empty/punctuation-only turns, fires `.completed`. `normalizeHypothesis` strips leading `.?! `. `sentenceBoundary` detects `. `(after letter) / `? ` / `! `. Endpoint silence: 1.2 s (rule-1), 1.8 s (rule-2), 60 s hard cap (rule-3). |
 | `OnnxTTSSpeaker.swift` | Synthesizes translated text via kitten-mini ONNX TTS (sherpa-onnx `SherpaOnnxOfflineTtsGenerateWithConfig`). Lazy model load on first `enqueue()`. Serial `DispatchQueue`. Batches all pending sentences into one synthesis call (up to `maxQueue = 5`). Drops oldest past cap. Converts Float32 → 24 kHz PCM16 LE via `AVAudioConverter`. Voice `sid = 2` (expr-voice-3-m). `isAvailable()` checks for `ModelConfig.ttsModel` in bundle. |
 | `LiveAudioServer.swift` | Hand-rolled HTTP/1.1 server on `NWListener` (port 8765). Routes: `/` → HTML listen page, `/live.wav` → open-ended WAV stream (24 kHz mono PCM16 LE, `0xFFFFFFFF` data size), `/events` → SSE transcript stream, others → 404. Heartbeat: 200 ms tick — pushes 50 ms of silence (2400 bytes) if idle >100 ms and speaker not active; every 25 ticks sends `: ping` SSE comment on event subscribers. `publishTranscript(jsonLine:)` sends JSONL line to SSE subscribers and buffers for replay (capped at 200). `audioListenerCount` drives TTS gating. `streamURL` prefers private IPv4 over `.local` over `localhost`. |
 | `TranscriptArchive.swift` | Per-run JSONL archive. One JSON object per line, keys sorted: `end`, `source`, `start`, `transcription`, `translation`. ISO-8601 timestamps with fractional seconds. `static func encodeLine(_:) -> String?` is also used by `LiveAudioServer.publishTranscript` so SSE and disk have identical payloads. Async writes via serial `DispatchQueue`. |
@@ -376,7 +394,7 @@ flowchart TD
 | `BufferBroadcaster.swift` | Fan-out helper. `var stream: AsyncStream<AVAudioPCMBuffer>` returns a fresh stream per access (critical — see "Things that have bitten us" #6 / #11). `emit(_:)` snapshots continuations under `NSLock`, yields outside it. `finishAll()` closes all subscribers — this is what drives graceful pipeline drain on Stop. |
 | `MicrophoneSource.swift` | `AVAudioEngine` mic capture. Converts hardware-native format → 48 kHz mono Float32 via `AVAudioConverter`. Permanent tap (installed once on first `start()`). `stop()` removes tap, stops engine, calls `broadcaster.finishAll()`. |
 | `SystemAudioSource.swift` | `ScreenCaptureKit` system audio capture. Audio-only (minimal 2×2 video config required by SCK). 48 kHz stereo → 48 kHz mono Float32 via `AVAudioConverter`. Rebuilds converter lazily if source format changes. Uses `CMSampleBufferCopyPCMDataIntoAudioBufferList` to avoid the AudioBufferList sizing trap (see #13). `stop()` calls `broadcaster.finishAll()`. |
-| `DenoisingAudioSource.swift` | Wraps any `AudioSource`, applies `RNNoiseProcessor` (per-instance), then AGC (Accelerate SIMD), then optional crosstalk gate (memset to 0 if `muteWhen?()` returns true). Re-broadcasts from its own `BufferBroadcaster`. Pump task runs for-await on upstream buffers; calls `broadcaster.finishAll()` when upstream ends. |
+| `DenoisingAudioSource.swift` | Wraps any `AudioSource`. Optional `RNNoise` (per-instance, mic only), optional AGC (envelope follower, Accelerate SIMD), optional crosstalk gate (memset to 0 if `muteWhen?()` returns true). Configured via `denoise` / `applyAGC` init flags. Re-broadcasts from its own `BufferBroadcaster`. Pump task is idempotent (lesson #45) — a second `start()` while alive is a no-op. |
 | `RNNoiseProcessor.swift` | Swift wrapper around vendored RNNoise C library. Buffers arbitrary input into 480-sample frames. Handles ±32768 ↔ ±1 scaling. 10 ms algorithmic latency. |
 | `AppleTranslator.swift` | `@MainActor` `Translator`. Holds a `TranslationSession` injected by the View via `Pipeline.installTranslationSession(_:)`. Throws `TranslateError.noSession` if the session isn't installed yet. |
 | `AudioRecorder.swift` | Per-stream `.wav` writer. `AVAudioFile` configured for 48 kHz mono Int16 PCM. `flush()` nils the file (forcing WAV header finalization) after a `queue.sync {}` drain — without finalization `AVAudioFile(forReading:)` sees a stale duration. |
@@ -384,8 +402,9 @@ flowchart TD
 | `MKVExporter.swift` | Shells out to ffmpeg (searched at `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`). Builds MKV: 640×360 black lavfi video at 10 fps, `amix` of per-source WAVs, merged SRTs embedded with ISO 639-3 language tags. Also contains `ZipArchiver` which wraps `/usr/bin/zip -j -q -X`. |
 | `CrashRecovery.swift` | Scans `NSTemporaryDirectory()` for leftover `livetranslate-<stamp>/` dirs at launch. For each, re-runs MKV export + zip + cleanup. Idempotent if a zip already exists. |
 | `Log.swift` | Append-only at `/tmp/livetranslate.log`. Truncates on startup if > 5 MB. Async writes via serial `DispatchQueue`. Format: `HH:mm:ss.SSS <message>\n`. |
-| `AppSettings.swift` | `ObservableObject` with `@AppStorage` keys for: `transcriptFontSize` (CGFloat), `translationFontSize` (CGFloat), `transcriptColorHex` (String), `translationColorHex` (String), `layoutMode` (`"mixed"` or `"side-by-side"`), `windowOpacity` (Double). Includes `Color(hex:)` init and `Color.hexString` computed property so stored hex strings round-trip through `Color` without loss. Propagated into the SwiftUI environment as `.environmentObject(settings)`. |
-| `OptionsView.swift` | SwiftUI `Settings` scene form. Typography section: sliders for transcript and translation font sizes (10–32 pt). Appearance section: `ColorPicker`s for transcript and translation text colours. Layout section: segmented control (`mixed` / `side-by-side`) with a live mini-preview of the two modes. Opacity section: slider for window background opacity (0.3–1.0). All controls write directly into `AppSettings` via `@EnvironmentObject`; changes are live (no Apply button). Opened by Cmd+, or the gear button in the menu-bar popover. |
+| `AppSettings.swift` | `ObservableObject` with `@Published` properties persisted to `UserDefaults` via `didSet`: `transcriptFontSize` / `translationFontSize` (Double), `transcriptColorHex` / `translationColorHex` (String), `layoutModeRaw` (mixed / sideBySide / compact), `windowOpacity` (Double), `showSource` (Bool). Also exposes `webPayload()` (JSON for the SSE settings event) and the dynamic `overlayBackgroundColor` / `overlayBackgroundHex()` for the web target. |
+| `OptionsView.swift` | SwiftUI `Settings` scene form. Typography (font sizes), Colors (color pickers), Layout (mixed / side-by-side / compact + show-source toggle), AI (FoundationModels toggle, visible only when available), Window (opacity slider). Resizable (`minWidth`/`idealWidth`). All controls write directly into `AppSettings` / `Pipeline`; changes are live. |
+| `SummaryView.swift` | Standalone window showing topic + 2-sentence summary. Auto-opens / dismisses based on `pipeline.aiAnalysisEnabled` via the `SummaryWindowController` helper view in the main window. `WindowConfigurer` (an `NSViewRepresentable`) replicates the main window's translucent / status-bar-level / hidden-title-bar style. |
 | `LiveAudioServer.swift` | Hand-rolled HTTP/1.1 server on `NWListener` (port 8765). Routes: `/` → HTML listen page, `/live.wav` → open-ended WAV stream (24 kHz mono PCM16 LE, `0xFFFFFFFF` data size), `/events` → SSE transcript stream, `/obs` → transparent-background OBS browser-source HTML page, `/obs-events` → dedicated SSE stream for OBS subscribers, others → 404. Heartbeat: 200 ms tick — pushes 50 ms of silence (2400 bytes) if idle >100 ms and speaker not active; every 25 ticks sends `: ping` SSE comment on `/events` and `/obs-events` subscribers. `publishTranscript(jsonLine:)` sends JSONL line to `/events` subscribers and buffers for replay (capped at 200). `publishHypothesis(id:source:text:)` sends a named `hypothesis` SSE event (with `id`, `source`, `text` fields) to `/events` subscribers only — not replayed. `publishHypothesisDone(id:)` sends a named `hypothesis-done` event. `obsSubscribers` dict is separate from `subscribers`; `publishOBSLine(jsonLine:)` broadcasts to OBS subscribers only. `audioListenerCount` drives TTS gating. `streamURL` prefers private IPv4 over `.local` over `localhost`. |
 | `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns `sentences`, `inflightChunks`, `translationCache`, `partialTranslationTimers`, `ttsSpeaker`, `liveAudioServer`, `ttsActive`, `ttsListenerCount`, `ttsModelLoaded`, `liveOBSURL: String?` (published; set when server starts). `LiveAudioServer` is always started unconditionally at run begin (not TTS-gated). Contains a second `AppleTranslator` instance (`obsTranslator`) wired to an `en→de` `TranslationSession` installed via `installOBSTranslationSession(_:)`. In `graduate()`, uses `NLLanguageRecognizer.dominantLanguage` (synchronous, on-device) to detect whether the final English translation is indeed English before dispatching `obsTranslator.translate(englishText)` for the OBS German subtitle stream. `applyLifecycle` also calls `liveAudioServer?.publishHypothesis` on `.partial` events and `publishHypothesisDone` on `.completed`/`.dropped`. |
 
@@ -465,7 +484,9 @@ position = WAV file position.
 ### Partial translation throttle
 
 In `applyLifecycle(.partial(text:))`: throttle via `partialTranslationTimers[id]`.
-At most one translation dispatch per chunk per second. The result is applied only if
+At most ~3 translation dispatches per chunk per second (0.3 s window — was
+1.0 s; latency audit showed Apple's on-device Translation comfortably handles
+100–200 ms/sentence, so 1 s was overly conservative). The result is applied only if
 the chunk's current state is still `.partial` with the same text (avoids overwriting
 a newer hypothesis). When `.completed` arrives with no prior partial translation, the
 chunk flips to `.translating`. When `.completed` arrives and there IS a partial
@@ -619,7 +640,10 @@ future builds reuse the grant.
 - Show/Hide uses `orderFrontRegardless()` (not `makeKeyAndOrderFront`) so bringing the overlay back does not steal focus from a full-screen app — the whole point of the overlay is to be non-intrusive.
 - `NSWorkspace.activeSpaceDidChangeNotification` observer calls `orderFrontRegardless()` after every Space transition. `.canJoinAllSpaces` puts the window into a full-screen Space automatically, but macOS does not re-raise it above the full-screen app's content — it just sits there invisible. The observer fires after the transition completes and brings it to front. Skipped when `window.isVisible == false` (user explicitly hid the overlay).
 - `mainWindow: NSWindow?` is captured via `WindowAccessor` into an App-level `@State` so the menu-bar Show/Hide button can order the window without searching `NSApp.windows`.
-- Compact mode: `@AppStorage("compactMode")` — hides the full bar, shows a slim bar.
+- **Main window content is the sentence list only.** Start/Stop, screen pick, stream share live in `MenuBarView` (the popover). The AI toggle and display preferences (typography, colors, layout, opacity, source icon) live in `OptionsView` (the SwiftUI `Settings` scene). Reverting to in-window controls is a regression (see lesson #41).
+- **`SummaryView` — separate window** for the LLM topic + summary. Opens / dismisses automatically based on `pipeline.aiAnalysisEnabled` via `SummaryWindowController` (a hidden `Color.clear` view in the main window that watches the flag and calls `openWindow`/`dismissWindow`). Uses the same `.hiddenTitleBar` + translucent overlay style as the main window.
+- **`overlayBackgroundColor`** (in `AppSettings.swift`) is the shared dynamic NS-color used by both windows. In dark mode it returns `~#0F0F0F` — deliberately darker than `.textBackgroundColor` (~#1E1E1E) so the overlay reads well over full-screen video. Light mode uses `.textBackgroundColor` unchanged. Web target reads the same value via the `settings` SSE event.
+- Layout: `AppSettings.LayoutMode` is `mixed` / `sideBySide` / `compact`. Compact replaces what used to be a top-level `@AppStorage("compactMode")` chevron toggle — it's a layout option that hides the transcript caption, leaving translation-only text. No bar/chevron remains.
 
 ---
 
@@ -630,8 +654,8 @@ future builds reuse the grant.
   `DenoisingAudioSource`
 - `ScreenCaptureKit` — system audio capture
 - `sherpa-onnx` (C API via `CSherpaOnnx` bridge target) — ASR (`OnlineRecognizer`,
-  streaming zipformer), VAD (`VoiceActivityDetector`, Silero), TTS (`OfflineTts`,
-  kitten-mini)
+  streaming zipformer) and TTS (`OfflineTts`, kitten-mini). The Silero VAD path
+  has been removed; voice activity is now an energy + ZCR test in Swift.
 - `Translation` (`TranslationSession`, `.translationTask`) — Apple on-device translation
 - `Network` (`NWListener`, `NWConnection`) — live audio HTTP server
 - `CoreImage` (`CIQRCodeGenerator`) — QR code for stream share popover

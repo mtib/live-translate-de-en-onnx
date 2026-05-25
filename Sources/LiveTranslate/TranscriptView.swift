@@ -111,17 +111,11 @@ struct TranscriptView: View {
                     Color.clear.frame(height: 1).id("BOTTOM")
                 }
                 .padding(.vertical, 2)
-                // Row add/remove (a new chunk arrives, a sentence is
-                // pruned) gets the .transition(.opacity) treatment via
-                // ID changes.
+                // Row add / remove only — keep .transition(.opacity)
+                // smoothing on these. Text content changes on an existing
+                // row update in place via `.contentTransition(.identity)`
+                // so partial growth doesn't flicker.
                 .animation(.easeInOut(duration: 0.09), value: displayRows.map(\.id))
-                // Any visible content change on an existing row —
-                // partial-text growth, partial translation refining,
-                // graduation — runs through this animation context.
-                // Combined with `.contentTransition(.opacity)` on the
-                // Text views inside `TranscriptRow`, each change
-                // cross-fades smoothly.
-                .animation(.easeInOut(duration: 0.09), value: displayRows.map(\.bodyKey))
             }
             .frame(minHeight: isCompactLayout ? 80 : 140)
             .scrollIndicators(.hidden)
@@ -164,7 +158,7 @@ enum DisplayRow: Identifiable, Equatable {
     /// so any change — kind transitions, partial-text growth, partial
     /// translation refinement, graduation — fires the surrounding
     /// `.animation(_, value:)` context. Combined with
-    /// `.contentTransition(.opacity)` on the Text views, every change
+    /// `.contentTransition(.identity)` on the Text views, every change
     /// cross-fades smoothly. Includes a leading discriminator so two
     /// states that happen to stringify to the same content (e.g. an
     /// inflight `.partial("foo", nil)` and a `.translating("foo")`)
@@ -225,14 +219,14 @@ struct TranscriptRow: View {
                         : AnyShapeStyle(settings.translationColor))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
-                    .contentTransition(.opacity)
+                    .contentTransition(.identity)
                 if !compact, let cap = captionText {
                     Text(cap)
                         .font(.system(size: self.cap(settings.transcriptFontSize)))
                         .foregroundStyle(settings.transcriptColor)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
-                        .contentTransition(.opacity)
+                        .contentTransition(.identity)
                 }
             }
         }
@@ -308,14 +302,14 @@ struct SideBySideRow: View {
                 .italic(isPlaceholder)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
-                .contentTransition(.opacity)
+                .contentTransition(.identity)
             Text(rightText)
                 .font(.system(size: settings.translationFontSize))
                 .foregroundStyle(isPlaceholder ? AnyShapeStyle(settings.translationColor.opacity(0.5)) : AnyShapeStyle(settings.translationColor))
                 .italic(isPlaceholder)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
-                .contentTransition(.opacity)
+                .contentTransition(.identity)
         }
         .padding(.vertical, 4)
     }

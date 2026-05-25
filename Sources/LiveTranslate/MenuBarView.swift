@@ -144,7 +144,6 @@ struct MenuBarView: View {
                 }
                 .padding(.vertical, 2)
                 .animation(.easeInOut(duration: 0.09), value: displayRows.map(\.id))
-                .animation(.easeInOut(duration: 0.09), value: displayRows.map(\.bodyKey))
             }
             // ~6 compact rows: callout font (~16pt) + 6pt spacing = ~22pt/row
             .frame(minHeight: 120, maxHeight: 240)
