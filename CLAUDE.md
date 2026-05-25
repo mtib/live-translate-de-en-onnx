@@ -1026,16 +1026,37 @@ tccutil reset ScreenCapture local.mtib.livetranslate
     with explicit init-time load. The projected-value binding (`$settings.x`) still
     works as expected.
 
-43. **`AVAudioEngine.setVoiceProcessingEnabled(true)` ducks system audio on macOS.**
-    Was attractive because it bundles AEC + NS + AGC in hardware (zero CPU) and
-    would let us delete RNNoise + manual AGC + the crosstalk gate on the mic.
-    Problem: it flips the audio session into a voice-chat profile that ducks
-    EVERY other audio source the user can hear — so they can't hear the system
-    audio they're capturing while recording. There is no flag to opt out. Also:
-    on macOS the input exposes 5 channels (processed mic + raw + reference
-    signals); without `converter.channelMap = [0]`, `AVAudioConverter` averages
-    all five into mono and the result is unusable. Revert path: keep RNNoise +
-    AGC + crosstalk gate on the mic in `DenoisingAudioSource`.
+43. **`AVAudioEngine.setVoiceProcessingEnabled(true)` ducks OTHER-APP audio on macOS.**
+    Was attractive: bundles AEC + NS + AGC in hardware (zero CPU), would let us
+    delete RNNoise + manual AGC + the crosstalk gate on the mic. Problem:
+    enabling VP engages CoreAudio's voice-chat I/O policy, which ducks
+    *"other-application" audio* at the speakers while the VP-enabled stream
+    is active. FaceTime works because the call audio is routed through
+    FaceTime's OWN voice-processing IO output node — that's "our app's
+    voice-processing audio", not other-app audio, so it's not ducked. (If
+    you had Music playing in another app during a FaceTime call, it would
+    still get attenuated.)
+    For LiveTranslate the audio we want to hear IS other-app audio (browser,
+    Zoom, etc. — the same audio SCK is capturing), so it's exactly what gets
+    ducked. The user can't comfortably monitor what they're capturing.
+    Escape hatches all have downsides:
+    - Route the captured system audio back through our own VP output node so
+      it counts as "our app's audio" — adds a playback chain, sync risk,
+      latency.
+    - Drop to a manual `AUAudioUnit(kAudioUnitSubType_VoiceProcessingIO)`
+      and set `kAUVoiceIOProperty_BypassVoiceProcessing` to skip AEC — but
+      it's not confirmed the duck policy disengages just from bypassing
+      processing.
+    - Set HAL volume / device properties — wrong layer; the duck is at the
+      session-policy level.
+    Also a separate gotcha: on macOS the VP-enabled input exposes a multi-
+    channel format (processed mic + raw + reference signals). Without
+    `converter.channelMap = [0]`, `AVAudioConverter` averages all channels
+    into mono and the result is unusable. If you ever revisit VP, set
+    `channelMap = [0]` AND solve the duck.
+    Current path: no VP. RNNoise + envelope-follower AGC + crosstalk gate
+    on the mic in `DenoisingAudioSource`. ~10 ms latency cost, a few
+    percent CPU; the system audio stays audible.
 
 44. **Window-level `alphaValue` for opacity also fades the text.** Setting
     `mainWindow.alphaValue = opacity` on the NSWindow applies opacity to every
