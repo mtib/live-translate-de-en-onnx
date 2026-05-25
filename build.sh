@@ -59,7 +59,8 @@ if [[ -f "${ONNX_VERSIONED}" ]]; then
 fi
 
 # ── ONNX models into Resources/ ─────────────────────────────────────────────
-cp "${MODELS_DIR}/silero_vad.onnx"          "${APP_DIR}/Contents/Resources/"
+# (Silero VAD was removed — replaced by energy + zero-cross-rate VAD in
+# SherpaTranscriber.)
 
 # German ASR model directory
 ASR_DIR="${MODELS_DIR}/sherpa-onnx-streaming-zipformer-de-kroko-2025-08-06"

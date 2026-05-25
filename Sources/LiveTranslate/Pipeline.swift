@@ -695,19 +695,17 @@ final class Pipeline: ObservableObject {
         guard micGranted else { status = .stopped(reason: "Microphone permission denied"); return }
 
         // 2. Per-stream wrappers.
-        //    - Mic: denoise/AGC off — `MicrophoneSource` runs through
-        //      AVAudioEngine's `VoiceProcessingIO` which does AEC + NS
-        //      + AGC in hardware. The wrapper retains the crosstalk
-        //      gate as defense in depth so both the recorder and the
-        //      transcriber see muted audio during system playback.
-        //    - System: denoise off (SCK delivers clean audio), AGC on
-        //      to normalize loudness against the mic.
+        //    - Mic: RNNoise + AGC + crosstalk gate. We do NOT use
+        //      VoiceProcessingIO because it ducks system audio on macOS
+        //      (so the user can't hear what they're capturing).
+        //    - System: SCK delivers clean audio — skip RNNoise. AGC
+        //      stays to normalize loudness against the mic.
         let sherpa = self.transcriber as? SherpaTranscriber
         let micDenoised = DenoisingAudioSource(
             micSource,
             label: "mic",
-            denoise: false,
-            applyAGC: false,
+            denoise: true,
+            applyAGC: true,
             muteWhen: { [weak sherpa] in sherpa?.isSystemRecentlyVoiced() ?? false }
         )
         let systemDenoised = DenoisingAudioSource(

@@ -29,10 +29,6 @@ enum ModelConfig {
     static var asrJoiner:  String { "\(asrModelDir)/joiner.onnx" }
     static var asrTokens:  String { "\(asrModelDir)/tokens.txt" }
 
-    // MARK: — VAD  (Silero-VAD)
-
-    static let vadModel = "silero_vad.onnx"
-
     // MARK: — TTS  (kitten-mini-en-v0_8)
 
     static let ttsModelDir = "kitten-mini-en-v0_8"

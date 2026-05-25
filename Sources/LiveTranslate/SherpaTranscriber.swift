@@ -6,10 +6,13 @@ import CSherpaOnnx
 /// sherpa-onnx streaming RNN-T transcriber — replaces `WhisperCppTranscriber`.
 ///
 /// **Pipeline per audio stream:**
-///   1. Receive 48 kHz mono Float32 buffers (post-RNNoise).
+///   1. Receive 48 kHz mono Float32 buffers (post-VoiceProcessingIO on mic,
+///      raw on system).
 ///   2. Resample to 16 kHz (AVAudioConverter, persistent across buffers).
-///   3. Push samples into a Silero-VAD instance for voiced/silence detection.
-///   4. Push voiced samples into the sherpa-onnx streaming recognizer.
+///   3. Energy + zero-cross-rate gate for voiced/silence detection — no
+///      ONNX inference, ~hundreds of ns per buffer.
+///   4. Push every buffer into the sherpa-onnx streaming recognizer; the
+///      voiced flag drives chunk-onset / endpoint logic only.
 ///   5. As ASR emits tokens, fire `.partial(text:)` so the UI shows live text.
 ///      The shown text is always the *active* portion of the hypothesis —
 ///      everything after the last mid-turn force-completion boundary.
@@ -39,8 +42,15 @@ final class SherpaTranscriber: Transcriber {
     /// stays at 2.4 s so long pauses still terminate.
     static let endpointSilenceSeconds: Float = 1.8
 
-    /// RMS used for the crosstalk gate.
+    /// RMS used for the crosstalk gate AND the energy-based VAD.
     static let silenceRMSThreshold: Float = 0.012
+
+    /// Zero-cross-rate gates for the energy + ZCR VAD that replaced
+    /// the Silero ONNX detector. Values below `min` are typically
+    /// tonal hum; above `max` are bursty broadband transients (typing).
+    /// Voiced speech sits comfortably in between.
+    static let minZeroCrossRate: Float = 0.02
+    static let maxZeroCrossRate: Float = 0.35
 
     /// How long after system-voiced we keep treating mic as contaminated.
     static let crosstalkPersistSeconds: TimeInterval = 0.25
@@ -248,8 +258,6 @@ final class SherpaTranscriber: Transcriber {
     ) async {
         let tag = source.rawValue
         var resampler = SherpaResampler()
-        let vad = makeVAD()
-        defer { if let v = vad { SherpaOnnxDestroyVoiceActivityDetector(v) } }
 
         guard let stream = SherpaOnnxCreateOnlineStream(recognizer) else {
             Log.line("SherpaTranscriber[\(tag)]: failed to create ASR stream")
@@ -298,19 +306,16 @@ final class SherpaTranscriber: Transcriber {
             cumulativeSamples += n
 
             effective.withUnsafeBufferPointer { ptr in
-                if let v = vad {
-                    SherpaOnnxVoiceActivityDetectorAcceptWaveform(v, ptr.baseAddress, Int32(n))
-                }
                 SherpaOnnxOnlineStreamAcceptWaveform(stream, 16_000, ptr.baseAddress, Int32(n))
             }
 
-            let voiced: Bool
-            if let v = vad {
-                voiced = SherpaOnnxVoiceActivityDetectorDetected(v) != 0
-                SherpaOnnxVoiceActivityDetectorClear(v)
-            } else {
-                voiced = computeRMS(effective) >= Self.silenceRMSThreshold
-            }
+            // Energy + zero-cross VAD. Speech sits in a sweet spot: enough
+            // RMS to clear the noise floor, AND enough mid-band content to
+            // produce a moderate zero-cross rate. Pure tones (fan hum,
+            // power-supply whine) clear the RMS gate but show very low ZCR;
+            // bursty broadband noise (keyboard, typing) can show very high
+            // ZCR. Treat both extremes as non-speech.
+            let voiced = isVoiced(effective)
 
             if voiced {
                 if !hadVoice {
@@ -582,36 +587,47 @@ final class SherpaTranscriber: Transcriber {
 
     // MARK: — Helpers
 
-    private func makeVAD() -> OpaquePointer? {
-        let vadPath = resourcePath(ModelConfig.vadModel)
-        guard FileManager.default.fileExists(atPath: vadPath) else {
-            Log.line("SherpaTranscriber: VAD model not in bundle, using RMS fallback")
-            return nil
+    /// Lightweight energy + zero-cross-rate voice detector. Replaces the
+    /// previous Silero ONNX VAD — no model load, no per-buffer ONNX
+    /// inference, zero allocations on the hot path.
+    ///
+    /// Heuristic:
+    ///   - RMS below `silenceRMSThreshold` (0.012)            → silent
+    ///   - ZCR below `minZeroCrossRate` (0.02)                → tonal noise
+    ///                                                          (fan hum,
+    ///                                                          PSU whine)
+    ///   - ZCR above `maxZeroCrossRate` (0.35)                → bursty
+    ///                                                          broadband
+    ///                                                          (keyboard,
+    ///                                                          clicks)
+    ///   - otherwise                                          → voiced
+    ///
+    /// At 16 kHz this is on the order of 100–200 ns per 10 ms buffer with
+    /// the vDSP RMS path, comfortably cheaper than even a single Silero
+    /// session.create.
+    private func isVoiced(_ samples: [Float]) -> Bool {
+        let n = samples.count
+        guard n > 0 else { return false }
+        let rms = computeRMS(samples)
+        guard rms >= Self.silenceRMSThreshold else { return false }
+        let zcr = zeroCrossRate(samples)
+        return zcr >= Self.minZeroCrossRate && zcr <= Self.maxZeroCrossRate
+    }
+
+    /// Fraction of adjacent-sample sign changes in the buffer. Pure tones
+    /// near DC give ~0, white noise gives ~0.5, voiced speech sits in
+    /// the 0.05–0.25 band depending on the speaker and microphone.
+    private func zeroCrossRate(_ samples: [Float]) -> Float {
+        let n = samples.count
+        guard n > 1 else { return 0 }
+        var crossings: Int = 0
+        var prev: Float = samples[0]
+        for i in 1..<n {
+            let cur = samples[i]
+            if (prev >= 0) != (cur >= 0) { crossings &+= 1 }
+            prev = cur
         }
-        var silero = SherpaOnnxSileroVadModelConfig()
-        memset_zero(&silero)
-        silero.threshold            = 0.5
-        silero.min_silence_duration = 0.25
-        silero.min_speech_duration  = 0.05
-        silero.window_size          = 512
-
-        var vadCfg = SherpaOnnxVadModelConfig()
-        memset_zero(&vadCfg)
-        vadCfg.sample_rate = 16_000
-        vadCfg.num_threads = 1
-        vadCfg.debug       = 0
-
-        let path     = vadPath
-        let provider = ModelConfig.provider
-
-        return path.withCString { cPath -> OpaquePointer? in
-            silero.model      = cPath
-            vadCfg.silero_vad = silero
-            return provider.withCString { cProv -> OpaquePointer? in
-                vadCfg.provider = cProv
-                return SherpaOnnxCreateVoiceActivityDetector(&vadCfg, 30)
-            }
-        }
+        return Float(crossings) / Float(n - 1)
     }
 
     /// Strip leading sentence-ending punctuation and spaces from an ASR

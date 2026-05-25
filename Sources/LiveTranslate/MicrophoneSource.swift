@@ -2,9 +2,15 @@ import Foundation
 import AVFoundation
 
 /// Microphone capture via `AVAudioEngine`. Emits 48 kHz mono Float32
-/// — the rate RNNoise expects natively (see `RNNoiseProcessor`).
-/// Downstream consumers (`SherpaTranscriber`, `AudioRecorder`) resample
-/// from this single common rate as needed.
+/// — RNNoise's native rate. Downstream consumers (`DenoisingAudioSource`,
+/// `SherpaTranscriber`, `AudioRecorder`) resample from this single rate
+/// as needed.
+///
+/// We deliberately do NOT enable AVAudioEngine's `VoiceProcessingIO`
+/// unit. It bundles AEC + noise suppression + AGC, but on macOS it also
+/// flips the audio session into a voice-chat mode that ducks every
+/// other audio source the user can hear — so they can't actually hear
+/// the system audio they're capturing while recording.
 final class MicrophoneSource: AudioSource {
     private let engine = AVAudioEngine()
     private var tapInstalled = false
@@ -31,23 +37,6 @@ final class MicrophoneSource: AudioSource {
             input.removeTap(onBus: 0)
             tapInstalled = false
         }
-        // Enable AVAudioEngine's VoiceProcessingIO unit — built-in AEC,
-        // noise suppression, and AGC, all in hardware on Apple Silicon
-        // (zero added CPU). This replaces the RNNoise denoise + manual
-        // AGC stage that used to live in DenoisingAudioSource. The
-        // engine's input format may change after enabling; we re-read it
-        // below before installing the tap.
-        do {
-            try input.setVoiceProcessingEnabled(true)
-            // Don't bypass on output (we're recording mic, not playback).
-            input.isVoiceProcessingBypassed = false
-            // Hardware AGC inside VP unit — leave it on; user controls
-            // mic gain via macOS Sound preferences.
-            input.isVoiceProcessingAGCEnabled = true
-        } catch {
-            // Voice processing isn't fatal — fall back to raw input.
-            Log.line("Mic: setVoiceProcessingEnabled failed (\(error.localizedDescription)) — using raw input")
-        }
         let native = input.outputFormat(forBus: 0)
         sourceFormat = native
         converter = AVAudioConverter(from: native, to: targetFormat)
@@ -59,7 +48,7 @@ final class MicrophoneSource: AudioSource {
         tapInstalled = true
         engine.prepare()
         try engine.start()
-        Log.line("Mic: started (voice-processing), native=\(native), target=\(targetFormat)")
+        Log.line("Mic: started, native=\(native), target=\(targetFormat)")
     }
 
     func stop() async {
