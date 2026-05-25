@@ -41,7 +41,11 @@ final class MicrophoneSource: AudioSource {
         sourceFormat = native
         converter = AVAudioConverter(from: native, to: targetFormat)
 
-        input.installTap(onBus: 0, bufferSize: 1024, format: native) { [weak self] buf, _ in
+        // 512 samples = ~10.7 ms at 48 kHz — half the previous 1024 (~21 ms)
+        // so partial ASR updates and endpoint detection see audio ~10 ms
+        // sooner. AVAudioEngine bills this as a hint, not a guarantee, but
+        // on M-series the buffer ends up at or near the requested size.
+        input.installTap(onBus: 0, bufferSize: 512, format: native) { [weak self] buf, _ in
             guard let self, let converted = self.convert(buf) else { return }
             self.broadcaster.emit(converted)
         }
