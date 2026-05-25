@@ -949,31 +949,37 @@ final class Pipeline: ObservableObject {
         let summarizer = TopicSummarizer()
 
         summaryLoopTask = Task.detached(priority: .background) { [weak self] in
-            // Poll every 2 s and run when any trigger condition is met:
-            //   • 10+ new sentences (run immediately regardless of time), or
-            //   • 45 s elapsed since last summary AND 3+ new sentences, or
-            //   • Opportunistic: ≥2 new sentences AND the system is idle
-            //     (no in-flight chunks, no new sentence in the last 4 s, and
-            //     at least 12 s since the previous summary). This catches
-            //     natural pauses between utterances so the summary stays
-            //     fresh during conversation without waiting on the timer.
-            // After a cycle completes, loop back without sleeping so that if
-            // conditions are already met again we run immediately.
+            // Poll every 2 s. Every trigger must observe an idle window
+            // (no inflight chunks AND ≥1.5 s since the last sentence
+            // landed) because the on-device LLM and the sherpa-onnx
+            // CoreML ASR both contend for the Apple Neural Engine —
+            // when the summarizer runs, ASR inference stalls and the
+            // transcript visibly "catches up" after the LLM finishes.
+            //
+            // Triggers (must ALL also be idle):
+            //   • 10+ new sentences, or
+            //   • 45 s elapsed AND 3+ new sentences, or
+            //   • Opportunistic: ≥2 new sentences AND ≥12 s since the
+            //     last summary AND the idle window has been at least 4 s.
+            // After a cycle completes, loop back without sleeping so that
+            // if conditions are already met again we run immediately.
             while !Task.isCancelled {
                 let shouldRun = await MainActor.run { [weak self] () -> Bool in
                     guard let self else { return false }
                     guard !self.summaryIsRunning else { return false }
+                    // ANE contention gate — never run the LLM while
+                    // audio is actively being decoded.
+                    guard self.inflightChunks.isEmpty else { return false }
+                    let lastSentenceAt = self.sentences.last?.createdAt ?? .distantPast
+                    let idleFor = -lastSentenceAt.timeIntervalSinceNow
+                    guard idleFor >= 1.5 else { return false }
+
                     let boundary = self.lastSummaryAt ?? Date()
                     let newCount = self.sentences.filter { $0.createdAt >= boundary }.count
                     let secondsSince = -boundary.timeIntervalSinceNow
                     if newCount >= 10 { return true }
                     if secondsSince >= 45 && newCount >= 3 { return true }
-                    // Opportunistic / idle trigger
-                    if newCount >= 2 && secondsSince >= 12 && self.inflightChunks.isEmpty {
-                        let lastSentenceAt = self.sentences.last?.createdAt ?? .distantPast
-                        let idleFor = -lastSentenceAt.timeIntervalSinceNow
-                        if idleFor >= 4 { return true }
-                    }
+                    if newCount >= 2 && secondsSince >= 12 && idleFor >= 4 { return true }
                     return false
                 }
 
