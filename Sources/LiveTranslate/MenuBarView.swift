@@ -44,32 +44,12 @@ struct MenuBarView: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
-            aiToggleButton
             ScreenPickButton(pipeline: pipeline)
             streamShareButton
             settingsButton
             overlayToggleButton
         }
         .animation(.easeInOut(duration: 0.2), value: pipeline.transcriptSummary?.topic)
-    }
-
-    @ViewBuilder
-    private var aiToggleButton: some View {
-        if pipeline.aiAnalysisAvailable {
-            Button {
-                pipeline.aiAnalysisEnabled.toggle()
-            } label: {
-                Image(systemName: "sparkles")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(
-                        pipeline.aiAnalysisEnabled
-                            ? Color.accentColor
-                            : Color.secondary
-                    )
-            }
-            .buttonStyle(.plain)
-            .help(pipeline.aiAnalysisEnabled ? "Disable AI analysis" : "Enable AI analysis")
-        }
     }
 
     private var primaryButton: some View {
@@ -156,7 +136,7 @@ struct MenuBarView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 6) {
                     ForEach(displayRows) { row in
-                        TranscriptRow(row: row, compact: true)
+                        TranscriptRow(row: row, compact: true, fontSizeCap: 15)
                             .id(row.id)
                             .transition(.opacity)
                     }
@@ -167,7 +147,7 @@ struct MenuBarView: View {
                 .animation(.easeInOut(duration: 0.18), value: displayRows.map(\.bodyKey))
             }
             // ~6 compact rows: callout font (~16pt) + 6pt spacing = ~22pt/row
-            .frame(minHeight: 50, maxHeight: 132)
+            .frame(minHeight: 120, maxHeight: 240)
             .scrollIndicators(.hidden)
             // Summary sits here (not in parent VStack) so its appearance never
             // changes the ScrollView frame — safeAreaInset adjusts content

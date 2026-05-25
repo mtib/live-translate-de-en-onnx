@@ -32,10 +32,11 @@ struct LiveTranslateApp: App {
                     mainWindow = window
                     configure(window)
                 })
-                .onAppear { installTerminateHook(pipeline: pipeline) }
-                .onChange(of: settings.windowOpacity) { _, opacity in
-                    mainWindow?.alphaValue = CGFloat(opacity)
+                .onAppear {
+                    installTerminateHook(pipeline: pipeline)
+                    pipeline.bindSettings(settings)
                 }
+                .background(SummaryWindowController(pipeline: pipeline))
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentMinSize)
@@ -56,8 +57,16 @@ struct LiveTranslateApp: App {
             }
         }
 
+        Window("AI Summary", id: "summary") {
+            SummaryView(pipeline: pipeline)
+                .environmentObject(settings)
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 380, height: 220)
+
         Settings {
-            OptionsView(settings: settings)
+            OptionsView(settings: settings, pipeline: pipeline)
         }
 
         // Status-bar icon. Clicking shows the compact transcript popover.

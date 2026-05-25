@@ -174,6 +174,12 @@ final class Pipeline: ObservableObject {
     private var ttsSpeaker: OnnxTTSSpeaker?
     private var liveAudioServer: LiveAudioServer?
 
+    /// Settings the web target should mirror (colors + font sizes).
+    /// Set by the App on launch via `bindSettings(_:)`; changes are
+    /// forwarded to `liveAudioServer` via a `settings` SSE event.
+    private var settings: AppSettings?
+    private var settingsCancellable: AnyCancellable?
+
     /// Optional screen-recording target. Settable any time:
     /// pre-session it just primes the next run; mid-session, combined
     /// with `startScreenRecording()` or `changeScreenRecording(to:)`,
@@ -221,6 +227,26 @@ final class Pipeline: ObservableObject {
                 self?.handleChunkLifecycle(id: id, source: source, event: event)
             }
         }
+    }
+
+    /// Wire the AppSettings instance so the web target can mirror
+    /// the same colors / font sizes as the macOS UI. Re-broadcasts
+    /// on every settings change.
+    func bindSettings(_ s: AppSettings) {
+        settings = s
+        settingsCancellable = s.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self, weak s] in
+                guard let self, let s else { return }
+                self.liveAudioServer?.publishSettings(json: s.webPayload())
+            }
+    }
+
+    /// Push the current settings JSON to the live audio server. Called
+    /// when the server is created during a session start.
+    private func pushInitialSettingsToServer() {
+        guard let server = liveAudioServer, let s = settings else { return }
+        server.publishSettings(json: s.webPayload())
     }
 
     // MARK: - Chunk lifecycle handler
@@ -616,7 +642,12 @@ final class Pipeline: ObservableObject {
             mergedSubtitles.removeAll()
             currentOutputs = nil
             inflightChunks.removeAll()
+            sentences.removeAll()
+            transcriptSummary = nil
+            lastSummary = nil
+            lastSummaryAt = nil
             partialTranslationTimers.removeAll()
+            translationCache.removeAll()
             ttsSpeaker?.stop()
             ttsSpeaker = nil
             // Defensive: if we exited early (e.g. permission failure)
@@ -639,7 +670,6 @@ final class Pipeline: ObservableObject {
             stopSummaryLoop()
             if restartRequested {
                 restartRequested = false
-                sentences = []
                 runTask = Task { await run() }
             }
         }
@@ -734,6 +764,7 @@ final class Pipeline: ObservableObject {
         do {
             try server.start()
             self.liveAudioServer = server
+            self.pushInitialSettingsToServer()
             self.liveOBSURL = LiveAudioServer.streamURL(port: liveStreamPort) + "obs"
             Log.line("Live server started — OBS URL: \(self.liveOBSURL ?? "?")")
 
@@ -897,9 +928,14 @@ final class Pipeline: ObservableObject {
         let summarizer = TopicSummarizer()
 
         summaryLoopTask = Task.detached(priority: .background) { [weak self] in
-            // Poll every 5 s and run when either trigger condition is met:
+            // Poll every 2 s and run when any trigger condition is met:
             //   • 10+ new sentences (run immediately regardless of time), or
-            //   • 60 s elapsed since last summary AND 5+ new sentences.
+            //   • 45 s elapsed since last summary AND 3+ new sentences, or
+            //   • Opportunistic: ≥2 new sentences AND the system is idle
+            //     (no in-flight chunks, no new sentence in the last 4 s, and
+            //     at least 12 s since the previous summary). This catches
+            //     natural pauses between utterances so the summary stays
+            //     fresh during conversation without waiting on the timer.
             // After a cycle completes, loop back without sleeping so that if
             // conditions are already met again we run immediately.
             while !Task.isCancelled {
@@ -909,7 +945,15 @@ final class Pipeline: ObservableObject {
                     let boundary = self.lastSummaryAt ?? Date()
                     let newCount = self.sentences.filter { $0.createdAt >= boundary }.count
                     let secondsSince = -boundary.timeIntervalSinceNow
-                    return newCount >= 10 || (secondsSince >= 60 && newCount >= 5)
+                    if newCount >= 10 { return true }
+                    if secondsSince >= 45 && newCount >= 3 { return true }
+                    // Opportunistic / idle trigger
+                    if newCount >= 2 && secondsSince >= 12 && self.inflightChunks.isEmpty {
+                        let lastSentenceAt = self.sentences.last?.createdAt ?? .distantPast
+                        let idleFor = -lastSentenceAt.timeIntervalSinceNow
+                        if idleFor >= 4 { return true }
+                    }
+                    return false
                 }
 
                 if shouldRun {
@@ -919,7 +963,7 @@ final class Pipeline: ObservableObject {
                     continue  // check again immediately before sleeping
                 }
 
-                try? await Task.sleep(for: .seconds(5))
+                try? await Task.sleep(for: .seconds(2))
             }
         }
         Log.line("TopicSummarizer: summary loop started")
@@ -961,8 +1005,8 @@ final class Pipeline: ObservableObject {
             return (context, new, self.lastSummary)
         }
 
-        guard (contextLines + newLines).count >= 3 else {
-            Log.line("TopicSummarizer: \((contextLines + newLines).count) sentences — skipping (need ≥ 3)")
+        guard (contextLines + newLines).count >= 2 else {
+            Log.line("TopicSummarizer: \((contextLines + newLines).count) sentences — skipping (need ≥ 2)")
             return
         }
 

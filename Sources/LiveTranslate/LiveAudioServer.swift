@@ -43,6 +43,9 @@ final class LiveAudioServer: @unchecked Sendable {
     /// Replay buffer for SSE — every finalized sentence as a JSONL line.
     /// Capped at 200 entries so very long sessions don't grow unbounded.
     private var eventReplay: [String] = []
+    /// Latest settings JSON (background + colors + font sizes). Sent on
+    /// connect and re-broadcast whenever the app's settings change.
+    private var currentSettings: String?
     private let lock = NSLock()
     private var heartbeatTask: Task<Void, Never>?
     private var lastSendAt: Date = .distantPast
@@ -133,6 +136,15 @@ final class LiveAudioServer: @unchecked Sendable {
         if let tr = translation { obj += ",\"translation\":\"\(jsonEscape(tr))\"" }
         obj += "}"
         broadcastToEventSubscribers("event: hypothesis\ndata: \(obj)\n\n")
+    }
+
+    /// Broadcast updated settings (colors + font sizes) to all event
+    /// subscribers AND store as the current value sent to new connects.
+    func publishSettings(json: String) {
+        lock.lock()
+        currentSettings = json
+        lock.unlock()
+        broadcastToEventSubscribers("event: settings\ndata: \(json)\n\n")
     }
 
     /// Sends a `hypothesis-done` SSE event to all event subscribers.
@@ -259,8 +271,12 @@ final class LiveAudioServer: @unchecked Sendable {
         // Replay buffered events so a late subscriber sees the session so far.
         lock.lock()
         let replay = eventReplay
+        let settings = currentSettings
         lock.unlock()
         var preamble = headers
+        if let settings {
+            preamble.append("event: settings\ndata: \(settings)\n\n".data(using: .utf8) ?? Data())
+        }
         for line in replay {
             preamble.append("data: \(line)\n\n".data(using: .utf8) ?? Data())
         }
@@ -612,15 +628,22 @@ final class LiveAudioServer: @unchecked Sendable {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="theme-color" content="#0a0a0a">
+    <meta name="theme-color" content="#0f0f0f">
     <title>LiveTranslate</title>
     <style>
-    :root { color-scheme: dark; }
+    :root {
+      color-scheme: dark;
+      --bg: #0f0f0f;
+      --translation: #eeeeee;
+      --transcript: #8a8a8a;
+      --translation-size: 16px;
+      --transcript-size: 13px;
+    }
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     html, body {
       margin: 0; padding: 0;
-      background: #0a0a0a; color: #f8f8f8;
-      font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg); color: var(--translation);
+      font: 16px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
       min-height: 100vh; min-height: 100dvh;
     }
     body {
@@ -630,7 +653,7 @@ final class LiveAudioServer: @unchecked Sendable {
     }
     header {
       position: sticky; top: 0;
-      background: rgba(10,10,10,0.92);
+      background: var(--bg);
       backdrop-filter: saturate(180%) blur(12px);
       -webkit-backdrop-filter: saturate(180%) blur(12px);
       padding: 14px 16px;
@@ -640,8 +663,8 @@ final class LiveAudioServer: @unchecked Sendable {
     }
     #play {
       flex: 0 0 auto; min-width: 110px; height: 44px;
-      border-radius: 22px; border: 1.5px solid #f8f8f8;
-      background: transparent; color: #f8f8f8;
+      border-radius: 22px; border: 1.5px solid var(--translation);
+      background: transparent; color: var(--translation);
       font-size: 15px; font-weight: 600; cursor: pointer;
       transition: background 0.12s, color 0.12s, transform 0.04s, border-color 0.12s;
     }
@@ -659,15 +682,13 @@ final class LiveAudioServer: @unchecked Sendable {
     .row { padding: 10px 0; border-bottom: 1px solid #1a1a1a; }
     .row:last-child { border-bottom: none; }
     .row .translation {
-      font-size: 19px; font-weight: 600; line-height: 1.35;
-      color: #f8f8f8; word-wrap: break-word;
+      font-size: var(--translation-size); font-weight: 500; line-height: 1.35;
+      color: var(--translation); word-wrap: break-word;
     }
     .row .transcription {
-      font-size: 13px; font-weight: 400; line-height: 1.35;
-      color: #aaa; margin-top: 3px; word-wrap: break-word;
+      font-size: var(--transcript-size); font-weight: 400; line-height: 1.35;
+      color: var(--transcript); margin-top: 3px; word-wrap: break-word;
     }
-    .row.hypothesis .translation { color: #999; font-style: italic; font-weight: 400; }
-    .row.hypothesis .transcription { color: #666; }
     @keyframes fadein {
       from { opacity: 0; transform: translateY(4px); }
       to   { opacity: 1; transform: translateY(0); }
@@ -765,6 +786,17 @@ final class LiveAudioServer: @unchecked Sendable {
         return s + '…';
       }
 
+      function onSettings(s) {
+        const root = document.documentElement;
+        if (s.backgroundHex)         root.style.setProperty('--bg', s.backgroundHex);
+        if (s.translationHex)        root.style.setProperty('--translation', s.translationHex);
+        if (s.transcriptHex)         root.style.setProperty('--transcript', s.transcriptHex);
+        if (typeof s.translationFontSize === 'number') root.style.setProperty('--translation-size', s.translationFontSize + 'px');
+        if (typeof s.transcriptFontSize === 'number')  root.style.setProperty('--transcript-size', s.transcriptFontSize + 'px');
+        const meta = document.querySelector('meta[name="theme-color"]');
+        if (meta && s.backgroundHex) meta.setAttribute('content', s.backgroundHex);
+      }
+
       function onHypothesis(d) {
         const empty = list.querySelector('.empty');
         // Don't create a row until there's something to show — avoids blank gaps
@@ -780,17 +812,21 @@ final class LiveAudioServer: @unchecked Sendable {
           hypothesisRows.set(d.id, row);
         }
         let tDiv = row.querySelector('.translation');
-        if (!tDiv) { tDiv = document.createElement('div'); tDiv.className = 'translation'; row.appendChild(tDiv); }
-        // Primary: translation when available, otherwise transcription, otherwise state label.
-        tDiv.textContent = (d.translation && d.translation.length > 0) ? d.translation
-                         : (d.text && d.text.length > 0) ? d.text
-                         : stateLabel(d.state);
-        // Caption: transcription when we're showing a translation.
         let sDiv = row.querySelector('.transcription');
-        if (d.translation && d.text && d.translation !== d.text) {
+        const hasTranslation = d.translation && d.translation.length > 0;
+        // Translation slot is populated only when a real translation exists.
+        if (hasTranslation) {
+          if (!tDiv) { tDiv = document.createElement('div'); tDiv.className = 'translation'; row.insertBefore(tDiv, row.firstChild); }
+          tDiv.textContent = d.translation;
+        } else if (tDiv) {
+          tDiv.remove();
+        }
+        // Transcription always renders as transcription (smaller, muted)
+        // — even when it's the only thing we have so far.
+        if (d.text && d.text.length > 0 && d.text !== d.translation) {
           if (!sDiv) { sDiv = document.createElement('div'); sDiv.className = 'transcription'; row.appendChild(sDiv); }
           sDiv.textContent = d.text;
-        } else if (sDiv) {
+        } else if (sDiv && !d.text) {
           sDiv.remove();
         }
         scrollToBottom();
@@ -844,6 +880,7 @@ final class LiveAudioServer: @unchecked Sendable {
         es.onmessage = (e) => { try { onFinalized(JSON.parse(e.data)); } catch {} };
         es.addEventListener('hypothesis', (e) => { try { onHypothesis(JSON.parse(e.data)); } catch {} });
         es.addEventListener('hypothesis-done', (e) => { try { onHypothesisDone(JSON.parse(e.data)); } catch {} });
+        es.addEventListener('settings', (e) => { try { onSettings(JSON.parse(e.data)); } catch {} });
         es.onerror = () => { es.close(); setTimeout(connectEvents, 2000); };
       }
       connectEvents();

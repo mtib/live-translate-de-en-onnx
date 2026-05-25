@@ -40,7 +40,6 @@ struct ScreenTargetChooser: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     displaySection(content.displays)
-                    windowSection(content.windows)
                 }
                 .padding(.trailing, 4)
             }
@@ -89,52 +88,6 @@ struct ScreenTargetChooser: View {
                     )
                 }
                 .buttonStyle(.plain)
-            }
-        }
-    }
-
-    // MARK: - Windows
-
-    @ViewBuilder
-    private func windowSection(_ windows: [SCWindow]) -> some View {
-        let ownBundleID = Bundle.main.bundleIdentifier
-        let pickable = windows.filter { w in
-            // Drop windows from our own process (floating overlay
-            // would otherwise be a feedback loop), windows with no
-            // title (system chrome, menu shadows), and zero-sized.
-            guard let app = w.owningApplication else { return false }
-            if app.bundleIdentifier == ownBundleID { return false }
-            guard let title = w.title, !title.isEmpty else { return false }
-            return w.frame.width > 32 && w.frame.height > 32
-        }
-        let grouped = Dictionary(grouping: pickable) {
-            $0.owningApplication?.applicationName ?? "Other"
-        }
-        let appNames = grouped.keys.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-
-        if !appNames.isEmpty {
-            Text("Windows")
-                .font(.caption.bold())
-                .foregroundStyle(.secondary)
-                .padding(.top, 4)
-            ForEach(appNames, id: \.self) { appName in
-                Text(appName)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 2)
-                ForEach(grouped[appName] ?? [], id: \.windowID) { window in
-                    Button {
-                        let filter = SCContentFilter(desktopIndependentWindow: window)
-                        onPicked(filter)
-                    } label: {
-                        row(
-                            icon: "macwindow",
-                            title: window.title ?? "(untitled)",
-                            subtitle: "\(Int(window.frame.width))×\(Int(window.frame.height))"
-                        )
-                    }
-                    .buttonStyle(.plain)
-                }
             }
         }
     }

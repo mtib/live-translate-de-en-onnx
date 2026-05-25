@@ -22,7 +22,6 @@ import CoreImage.CIFilterBuiltins
 /// other settings live in `Pipeline` (which persists them via UserDefaults).
 struct TranscriptView: View {
     @ObservedObject var pipeline: Pipeline
-    @AppStorage("compactMode") private var compactMode: Bool = false
     @EnvironmentObject var settings: AppSettings
 
     private var translationConfig: TranslationSession.Configuration {
@@ -39,7 +38,7 @@ struct TranscriptView: View {
             // in dark) — more contrast against the primary text than
             // `windowBackgroundColor` would give. 0.7 opacity keeps
             // the overlay see-through over content behind it.
-            Color(nsColor: .textBackgroundColor)
+            overlayBackgroundColor
                 .opacity(settings.windowOpacity)
                 .ignoresSafeArea()
             content
@@ -88,53 +87,11 @@ struct TranscriptView: View {
 
     @ViewBuilder
     private var content: some View {
-        if compactMode {
-            VStack(alignment: .leading, spacing: 6) {
-                compactBar
-                summaryBar
-                sentenceList(compact: true)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary?.summary)
-        } else {
-            VStack(alignment: .leading, spacing: 10) {
-                fullBar
-                if case .stopped(let reason) = pipeline.status {
-                    errorBanner(reason)
-                }
-                summaryBar
-                sentenceList(compact: false)
-            }
+        sentenceList()
             .padding(14)
-            .animation(.easeInOut(duration: 0.25), value: pipeline.transcriptSummary?.summary)
-        }
     }
 
     // MARK: - Bars
-
-    /// Compact bar: primary action, current topic (if any), icon row.
-    /// In-flight activity is shown in the sentence list itself (one
-    /// row per active chunk), so the bar stays minimal.
-    private var compactBar: some View {
-        HStack(spacing: 6) {
-            primaryButton(compact: true)
-            if let topic = pipeline.transcriptSummary?.topic {
-                Text(topic)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 4)
-            aiToggleButton
-            ScreenPickButton(pipeline: pipeline)
-            streamShareButton
-            iconButton("chevron.down", help: "Show controls") {
-                compactMode = false
-            }
-        }
-        .animation(.easeInOut(duration: 0.2), value: pipeline.transcriptSummary?.topic)
-    }
 
     /// Full bar: primary action, current topic (if any), icon row.
     private var fullBar: some View {
@@ -147,35 +104,10 @@ struct TranscriptView: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 6)
-            aiToggleButton
             ScreenPickButton(pipeline: pipeline)
             streamShareButton
-            iconButton("chevron.up", help: "Compact view") {
-                compactMode = true
-            }
         }
         .animation(.easeInOut(duration: 0.2), value: pipeline.transcriptSummary?.topic)
-    }
-
-    /// Sparkle toggle — only shown when Apple Intelligence is available.
-    /// Tinted accent when on, secondary when off.
-    @ViewBuilder
-    private var aiToggleButton: some View {
-        if pipeline.aiAnalysisAvailable {
-            Button {
-                pipeline.aiAnalysisEnabled.toggle()
-            } label: {
-                Image(systemName: "sparkles")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(
-                        pipeline.aiAnalysisEnabled
-                            ? Color.accentColor
-                            : Color.secondary
-                    )
-            }
-            .buttonStyle(.plain)
-            .help(pipeline.aiAnalysisEnabled ? "Disable AI analysis" : "Enable AI analysis")
-        }
     }
 
     /// Stream share button — visible only when a TTS audio stream is
@@ -283,16 +215,6 @@ struct TranscriptView: View {
         .keyboardShortcut(.return, modifiers: [])
     }
 
-    private func iconButton(_ systemName: String, help: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
-        }
-        .buttonStyle(.plain)
-        .help(help)
-    }
-
     // MARK: - Sentence list
 
     /// Auto-scrolling list. Sentences and inflight chunks share one
@@ -301,16 +223,17 @@ struct TranscriptView: View {
     /// SwiftUI sees an in-place content update on the same row — no
     /// remove+insert, no flicker. `.transition(.opacity)` still fires
     /// for real adds (new chunk) and real removes (pruned sentence).
-    private func sentenceList(compact: Bool) -> some View {
-        ScrollViewReader { proxy in
+    private func sentenceList() -> some View {
+        let isCompactLayout = settings.layoutMode == .compact
+        return ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: compact ? 6 : 8) {
+                LazyVStack(alignment: .leading, spacing: isCompactLayout ? 6 : 8) {
                     ForEach(displayRows) { row in
                         Group {
-                            if settings.layoutMode == .sideBySide {
-                                SideBySideRow(row: row)
-                            } else {
-                                TranscriptRow(row: row, compact: compact)
+                            switch settings.layoutMode {
+                            case .sideBySide: SideBySideRow(row: row)
+                            case .compact:    TranscriptRow(row: row, compact: true)
+                            case .mixed:      TranscriptRow(row: row, compact: false)
                             }
                         }
                         .id(row.id)
@@ -331,7 +254,7 @@ struct TranscriptView: View {
                 // cross-fades smoothly.
                 .animation(.easeInOut(duration: 0.18), value: displayRows.map(\.bodyKey))
             }
-            .frame(minHeight: compact ? 50 : 140)
+            .frame(minHeight: isCompactLayout ? 80 : 140)
             .scrollIndicators(.hidden)
             .onChange(of: displayRows.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.12)) {
@@ -409,17 +332,24 @@ enum DisplayRow: Identifiable, Equatable {
 struct TranscriptRow: View {
     let row: DisplayRow
     let compact: Bool
+    var fontSizeCap: Double? = nil
     @EnvironmentObject var settings: AppSettings
+
+    private func cap(_ v: Double) -> Double {
+        fontSizeCap.map { min(v, $0) } ?? v
+    }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: source.iconSystemName)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
-                .frame(width: 14, alignment: .center)
+            if settings.showSource {
+                Image(systemName: source.iconSystemName)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 14, alignment: .center)
+            }
             VStack(alignment: .leading, spacing: 1) {
                 Text(primaryText)
-                    .font(compact ? .callout : .system(size: isPlaceholder ? settings.transcriptFontSize : settings.translationFontSize))
+                    .font(.system(size: cap(isPlaceholder ? settings.transcriptFontSize : settings.translationFontSize)))
                     .italic(isPlaceholder)
                     .foregroundStyle(isPlaceholder
                         ? AnyShapeStyle(settings.transcriptColor.opacity(0.6))
@@ -429,7 +359,7 @@ struct TranscriptRow: View {
                     .contentTransition(.opacity)
                 if !compact, let cap = captionText {
                     Text(cap)
-                        .font(.system(size: settings.transcriptFontSize))
+                        .font(.system(size: self.cap(settings.transcriptFontSize)))
                         .foregroundStyle(settings.transcriptColor)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
@@ -496,6 +426,13 @@ struct SideBySideRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 16) {
+            if settings.showSource {
+                Image(systemName: source.iconSystemName)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 14, alignment: .center)
+                    .padding(.top, 4)
+            }
             Text(leftText)
                 .font(.system(size: settings.transcriptFontSize))
                 .foregroundStyle(isPlaceholder ? AnyShapeStyle(settings.transcriptColor.opacity(0.5)) : AnyShapeStyle(settings.transcriptColor))
@@ -522,6 +459,13 @@ struct SideBySideRow: View {
             case .partial(_, let t): return t == nil
             default: return true
             }
+        }
+    }
+
+    private var source: SourceTag {
+        switch row {
+        case .sentence(let s): return s.source
+        case .inflight(let c): return c.source
         }
     }
 

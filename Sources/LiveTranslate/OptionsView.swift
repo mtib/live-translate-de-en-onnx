@@ -2,6 +2,7 @@ import SwiftUI
 
 struct OptionsView: View {
     @ObservedObject var settings: AppSettings
+    @ObservedObject var pipeline: Pipeline
     @State private var transcriptColor: Color  = .secondary
     @State private var translationColor: Color = .primary
 
@@ -40,8 +41,17 @@ struct OptionsView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 Group {
-                    if settings.layoutMode == .mixed { mixedPreview }
-                    else { sideBySidePreview }
+                    switch settings.layoutMode {
+                    case .mixed:      mixedPreview
+                    case .sideBySide: sideBySidePreview
+                    case .compact:    compactPreview
+                    }
+                }
+                Toggle("Show source (mic / system icon)", isOn: $settings.showSource)
+            }
+            if pipeline.aiAnalysisAvailable {
+                Section("AI") {
+                    Toggle("AI analysis (topic + summary)", isOn: $pipeline.aiAnalysisEnabled)
                 }
             }
             Section("Window") {
@@ -56,7 +66,7 @@ struct OptionsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 380)
+        .frame(minWidth: 380, idealWidth: 420, minHeight: 420, idealHeight: 520)
         .padding()
         .onAppear {
             transcriptColor  = settings.transcriptColor
@@ -72,6 +82,15 @@ struct OptionsView: View {
             Text("Transcription sits below as a caption")
                 .font(.system(size: settings.transcriptFontSize))
                 .foregroundStyle(settings.transcriptColor)
+        }
+        .padding(.top, 4)
+    }
+
+    private var compactPreview: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Translation only — no transcript caption")
+                .font(.system(size: settings.translationFontSize))
+                .foregroundStyle(settings.translationColor)
         }
         .padding(.top, 4)
     }
