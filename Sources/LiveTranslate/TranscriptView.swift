@@ -114,14 +114,14 @@ struct TranscriptView: View {
                 // Row add/remove (a new chunk arrives, a sentence is
                 // pruned) gets the .transition(.opacity) treatment via
                 // ID changes.
-                .animation(.easeInOut(duration: 0.18), value: displayRows.map(\.id))
+                .animation(.easeInOut(duration: 0.09), value: displayRows.map(\.id))
                 // Any visible content change on an existing row —
                 // partial-text growth, partial translation refining,
                 // graduation — runs through this animation context.
                 // Combined with `.contentTransition(.opacity)` on the
                 // Text views inside `TranscriptRow`, each change
                 // cross-fades smoothly.
-                .animation(.easeInOut(duration: 0.18), value: displayRows.map(\.bodyKey))
+                .animation(.easeInOut(duration: 0.09), value: displayRows.map(\.bodyKey))
             }
             .frame(minHeight: isCompactLayout ? 80 : 140)
             .scrollIndicators(.hidden)
