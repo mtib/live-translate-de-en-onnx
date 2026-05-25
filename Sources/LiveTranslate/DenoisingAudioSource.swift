@@ -2,23 +2,23 @@ import Foundation
 import AVFoundation
 import Accelerate
 
-/// Wraps any `AudioSource` and applies `RNNoise` to its 48 kHz mono
-/// Float32 buffers before re-broadcasting. Each input stream (mic,
-/// system) gets its own instance so denoiser state is independent.
+/// Wraps any `AudioSource` and applies optional RNNoise + AGC + crosstalk
+/// gate to its 48 kHz mono Float32 buffers before re-broadcasting.
 ///
-/// **Why per-stream denoising?** RNNoise's GRU keeps state across
-/// frames — if we summed mic + system first and denoised the mix
-/// (the previous design), the network sees a confusing combined
-/// signal and the denoiser performs noticeably worse than on each
-/// stream separately. With independent denoisers the network can
-/// adapt to the room noise vs. ambient computer audio independently.
+/// **Mic** uses `denoise=false`, `applyAGC=false` — the upstream
+/// `MicrophoneSource` is now configured with AVAudioEngine's
+/// `VoiceProcessingIO` which does AEC + noise suppression + AGC in
+/// hardware. Only the crosstalk gate stays as defense in depth.
 ///
-/// Format invariant: upstream MUST emit 48 kHz mono Float32 (RNNoise's
-/// native rate). Both `MicrophoneSource` and `SystemAudioSource`
-/// already produce that, so wrapping them is a drop-in.
+/// **System** uses `denoise=false`, `applyAGC=true` — SCK delivers
+/// pristine app audio (no acoustic noise), so RNNoise can only soften
+/// transients. AGC stays to normalize loudness against the mic stream.
+///
+/// Format invariant: upstream MUST emit 48 kHz mono Float32.
 final class DenoisingAudioSource: AudioSource {
     private let upstream: AudioSource
-    private let denoiser = RNNoiseProcessor()
+    private let denoiser: RNNoiseProcessor?
+    private let applyAGCEnabled: Bool
     private let broadcaster = BufferBroadcaster()
     private let label: String
     /// Optional crosstalk gate. When set and returns `true`, the
@@ -34,7 +34,7 @@ final class DenoisingAudioSource: AudioSource {
     // loudness levels; the mic depends on speaker distance and gain
     // staging, system audio on the source app's mastering. Without
     // AGC, one stream often dominates the mix and the quieter one
-    // gets buried (both in the WAV/MKV mix and in whisper's input).
+    // gets buried (both in the per-source WAV and in the ASR input).
     //
     // We run a lightweight envelope-follower AGC per instance:
     //   - measure each buffer's RMS via `vDSP_measqv` (SIMD)
@@ -66,13 +66,24 @@ final class DenoisingAudioSource: AudioSource {
 
     var buffers: AsyncStream<AVAudioPCMBuffer> { broadcaster.stream }
 
-    init(_ upstream: AudioSource, label: String, muteWhen: (@Sendable () -> Bool)? = nil) {
+    init(
+        _ upstream: AudioSource,
+        label: String,
+        denoise: Bool = true,
+        applyAGC: Bool = true,
+        muteWhen: (@Sendable () -> Bool)? = nil
+    ) {
         self.upstream = upstream
         self.label = label
+        self.denoiser = denoise ? RNNoiseProcessor() : nil
+        self.applyAGCEnabled = applyAGC
         self.muteWhen = muteWhen
     }
 
     func start() async throws {
+        // Idempotent: a second start() while the pump is alive would
+        // spawn a duplicate iterator and double-broadcast every buffer.
+        if pumpTask != nil { return }
         try await upstream.start()
         pumpTask = Task { [weak self] in
             guard let self else { return }
@@ -110,9 +121,9 @@ final class DenoisingAudioSource: AudioSource {
         broadcaster.finishAll()
     }
 
-    /// Apply RNNoise to one 48 kHz mono Float32 buffer. Allocates a
-    /// fresh output buffer of the same shape. Returns nil only on
-    /// allocation failure (effectively never).
+    /// Apply optional RNNoise + AGC + crosstalk gate to one 48 kHz mono
+    /// Float32 buffer. Allocates a fresh output buffer of the same shape.
+    /// Returns nil only on allocation failure (effectively never).
     private func denoise(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
         guard input.format.channelCount == 1,
               let inData = input.floatChannelData?[0]
@@ -124,24 +135,24 @@ final class DenoisingAudioSource: AudioSource {
         out.frameLength = AVAudioFrameCount(n)
         guard let outData = out.floatChannelData?[0] else { return nil }
 
-        denoiser.feed(samples: inData, count: n)
-        let drained = denoiser.drain(into: outData, count: n)
-        if drained < n {
-            // First buffer or two may not have enough denoised samples
-            // to fill the output (RNNoise has a 10 ms / 480-sample
-            // latency at 48 kHz). Pad with silence rather than emit
-            // garbage.
-            memset(outData.advanced(by: drained), 0, (n - drained) * MemoryLayout<Float>.size)
+        if let denoiser {
+            denoiser.feed(samples: inData, count: n)
+            let drained = denoiser.drain(into: outData, count: n)
+            if drained < n {
+                // RNNoise has a 10 ms / 480-sample latency at 48 kHz;
+                // pad with silence rather than garbage on the first
+                // buffer or two.
+                memset(outData.advanced(by: drained), 0, (n - drained) * MemoryLayout<Float>.size)
+            }
+        } else {
+            // Passthrough: copy input to output verbatim.
+            memcpy(outData, inData, n * MemoryLayout<Float>.size)
         }
-        // Auto-gain (SIMD, Accelerate). Adapt to the stream's loudness
-        // before the crosstalk gate so the gate-mute is true silence,
-        // not muted-but-loud-noise. Updates the running gain only on
-        // voiced buffers so silence keeps the previous gain.
-        applyAGC(to: outData, count: n)
-        // Crosstalk gate (mic only, when system is voiced) — replace
-        // the whole buffer with silence. Done AFTER denoising so the
-        // RNNoise GRU stays in a sensible state on the next non-muted
-        // buffer (feeding it zeros would skew its envelope follower).
+        if applyAGCEnabled {
+            applyAGC(to: outData, count: n)
+        }
+        // Crosstalk gate — applied AFTER everything else so the muted
+        // window is true silence, not gained noise.
         if muteWhen?() == true {
             memset(outData, 0, n * MemoryLayout<Float>.size)
         }

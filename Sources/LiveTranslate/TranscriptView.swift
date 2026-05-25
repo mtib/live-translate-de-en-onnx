@@ -4,22 +4,16 @@ import AppKit
 import CoreImage
 import CoreImage.CIFilterBuiltins
 
-/// Main UI surface. Two layouts:
-///   - Full mode (`!compactMode`): one-row control bar (Start/Stop,
-///     source / target language pickers, compact toggle) followed by
-///     the rolling sentence list.
-///   - Compact mode: a slim bar (play/stop + language pair + expand)
-///     with the sentence list directly below. Designed to float as
-///     a small hover overlay over other content.
+/// Main UI surface. Renders ONLY the rolling sentence list — Start/Stop,
+/// screen picker, stream share, and the AI toggle live in the menu-bar
+/// popover (`MenuBarView`) and the Settings window (`OptionsView`).
 ///
-/// The sentence list shows completed `Sentence` rows followed by any
-/// `InflightChunk` rows currently in flight (listening / transcribing /
-/// translating). When a chunk graduates, its inflight row is replaced
-/// by the matching sentence with the same UUID, so SwiftUI animates
-/// the transition smoothly.
+/// The list shows completed `Sentence` rows followed by any `InflightChunk`
+/// rows currently in flight (listening / partial / translating). When a
+/// chunk graduates, its inflight row is replaced by the matching sentence
+/// with the same UUID, so SwiftUI animates the transition in place.
 ///
-/// The view persists its compact-mode preference via `@AppStorage`. All
-/// other settings live in `Pipeline` (which persists them via UserDefaults).
+/// Layout (mixed / side-by-side / compact) is read from `AppSettings`.
 struct TranscriptView: View {
     @ObservedObject var pipeline: Pipeline
     @EnvironmentObject var settings: AppSettings
@@ -85,134 +79,9 @@ struct TranscriptView: View {
         }
     }
 
-    @ViewBuilder
     private var content: some View {
         sentenceList()
             .padding(14)
-    }
-
-    // MARK: - Bars
-
-    /// Full bar: primary action, current topic (if any), icon row.
-    private var fullBar: some View {
-        HStack(spacing: 10) {
-            primaryButton(compact: false)
-            if let topic = pipeline.transcriptSummary?.topic {
-                Text(topic)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 6)
-            ScreenPickButton(pipeline: pipeline)
-            streamShareButton
-        }
-        .animation(.easeInOut(duration: 0.2), value: pipeline.transcriptSummary?.topic)
-    }
-
-    /// Stream share button — visible only when a TTS audio stream is
-    /// live (i.e. the target language has a voice installed and
-    /// src != tgt). Click pops a small panel with the stream URL
-    /// (copyable) and a QR code of the same URL for phone listeners.
-    /// Tints green while a listener is connected AND the TTS model has
-    /// finished its lazy load (i.e. the speaker is actively producing
-    /// audio for someone).
-    @State private var streamShareShown: Bool = false
-    @ViewBuilder
-    private var streamShareButton: some View {
-        if pipeline.liveStreamURL != nil || pipeline.liveOBSURL != nil {
-            Button {
-                streamShareShown.toggle()
-            } label: {
-                Image(systemName: "dot.radiowaves.left.and.right")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(
-                        pipeline.ttsActive ? AnyShapeStyle(.green) : AnyShapeStyle(.secondary)
-                    )
-                    .animation(.easeInOut(duration: 0.25), value: pipeline.ttsActive)
-            }
-            .buttonStyle(.plain)
-            .help(pipeline.ttsActive ? "Live audio stream — listener connected" : "Live translated-audio stream")
-            .popover(isPresented: $streamShareShown, arrowEdge: .bottom) {
-                StreamShareView(
-                    url: pipeline.liveStreamURL ?? pipeline.liveOBSURL ?? "",
-                    obsURL: pipeline.liveOBSURL
-                )
-                .padding(16)
-                .frame(width: 240)
-            }
-        }
-    }
-
-    /// Summary bar: shows the LLM-generated topic label and 2-sentence
-    /// summary produced by Pipeline every 60 seconds. Hidden when
-    /// `transcriptSummary` is nil (i.e. before the first summary arrives).
-    @ViewBuilder
-    private var summaryBar: some View {
-        if let s = pipeline.transcriptSummary, !s.summary.isEmpty {
-            Text(s.summary)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(3)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .transition(.opacity.combined(with: .move(edge: .top)))
-        }
-    }
-
-    /// Inline banner shown only on `.stopped(reason:)`. Suppressed for
-    /// idle / running so the UI stays quiet in the common case.
-    private func errorBanner(_ reason: String) -> some View {
-        Label(reason, systemImage: "exclamationmark.triangle.fill")
-            .font(.caption)
-            .foregroundStyle(.orange)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 4)
-            .padding(.horizontal, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 5)
-                    .fill(Color.orange.opacity(0.12))
-            )
-    }
-
-    // MARK: - Building blocks
-
-    /// Start/Stop with a spinner state during finalize (writers
-    /// flushing + MKV export). Disabled while spinning so the user
-    /// can't kick off a new session mid-export.
-    private func primaryButton(compact: Bool) -> some View {
-        let finalizing = pipeline.status.isFinalizing
-        return Button {
-            pipeline.toggle()
-        } label: {
-            if compact {
-                if finalizing {
-                    ProgressView()
-                        .controlSize(.small)
-                        .frame(width: 14, height: 14)
-                } else {
-                    Image(systemName: pipeline.isRunning ? "stop.fill" : "play.fill")
-                        .font(.system(size: 11, weight: .semibold))
-                        .frame(width: 14, height: 14)
-                }
-            } else {
-                HStack(spacing: 5) {
-                    if finalizing {
-                        ProgressView().controlSize(.small)
-                        Text("Stopping…")
-                    } else {
-                        Image(systemName: pipeline.isRunning ? "stop.fill" : "play.fill")
-                            .font(.system(size: 10, weight: .semibold))
-                        Text(pipeline.isRunning ? "Stop" : "Start")
-                    }
-                }
-            }
-        }
-        .buttonStyle(.bordered)
-        .controlSize(compact ? .small : .regular)
-        .tint(finalizing ? .secondary : (pipeline.isRunning ? .red : .accentColor))
-        .disabled(finalizing)
-        .keyboardShortcut(.return, modifiers: [])
     }
 
     // MARK: - Sentence list

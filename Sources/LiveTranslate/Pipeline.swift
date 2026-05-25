@@ -233,9 +233,14 @@ final class Pipeline: ObservableObject {
     /// the same colors / font sizes as the macOS UI. Re-broadcasts
     /// on every settings change.
     func bindSettings(_ s: AppSettings) {
+        guard settings !== s else { return }   // idempotent — onAppear may re-fire
         settings = s
+        // Throttle web broadcasts so rapid slider/color-picker drags
+        // don't hammer the SSE channel. `objectWillChange` fires before
+        // the value changes, so we hop to the next runloop tick to read
+        // the updated state.
         settingsCancellable = s.objectWillChange
-            .receive(on: RunLoop.main)
+            .throttle(for: .milliseconds(200), scheduler: RunLoop.main, latest: true)
             .sink { [weak self, weak s] in
                 guard let self, let s else { return }
                 self.liveAudioServer?.publishSettings(json: s.webPayload())
@@ -269,6 +274,10 @@ final class Pipeline: ObservableObject {
     private func applyLifecycle(
         id: UUID, source: SourceTag, event: SherpaTranscriber.ChunkLifecycle
     ) {
+        // Drop any lifecycle event that lands after the run has wound
+        // down — without this, a late MainActor hop or a still-pending
+        // translation can append a phantom row into the cleared UI.
+        guard isActive else { return }
         switch event {
         case .listening:
             // Reserve a row at voice onset.
@@ -395,6 +404,10 @@ final class Pipeline: ObservableObject {
         id: UUID, source: SourceTag, text: String, translation: String,
         createdAt: Date, endsAt: Date
     ) {
+        // Late translation tasks can call graduate after `stop()` has
+        // already cleared the run. Drop them to keep the UI/archive
+        // consistent with "clear on finalize".
+        guard isActive else { return }
         let sentence = Sentence(
             id: id, text: text, translation: translation, source: source,
             createdAt: createdAt, endsAt: endsAt, lastModified: Date()
@@ -681,21 +694,28 @@ final class Pipeline: ObservableObject {
         }
         guard micGranted else { status = .stopped(reason: "Microphone permission denied"); return }
 
-        // 2. Per-stream `DenoisingAudioSource`s. The mic instance gets
-        //    a crosstalk gate that queries the transcriber's
-        //    `lastSystemVoicedAt` and zeros the buffer when system was
-        //    recently voiced. Applied upstream of the broadcaster so
-        //    BOTH consumers (AudioRecorder + transcriber accumulator)
-        //    see the same muted audio — without this, `.mic.wav` still
-        //    had the raw speaker bleed even though the transcript
-        //    suppressed it.
+        // 2. Per-stream wrappers.
+        //    - Mic: denoise/AGC off — `MicrophoneSource` runs through
+        //      AVAudioEngine's `VoiceProcessingIO` which does AEC + NS
+        //      + AGC in hardware. The wrapper retains the crosstalk
+        //      gate as defense in depth so both the recorder and the
+        //      transcriber see muted audio during system playback.
+        //    - System: denoise off (SCK delivers clean audio), AGC on
+        //      to normalize loudness against the mic.
         let sherpa = self.transcriber as? SherpaTranscriber
         let micDenoised = DenoisingAudioSource(
             micSource,
             label: "mic",
+            denoise: false,
+            applyAGC: false,
             muteWhen: { [weak sherpa] in sherpa?.isSystemRecentlyVoiced() ?? false }
         )
-        let systemDenoised = DenoisingAudioSource(systemSource, label: "system")
+        let systemDenoised = DenoisingAudioSource(
+            systemSource,
+            label: "system",
+            denoise: false,
+            applyAGC: true
+        )
         let denoised: [SourceTag: AudioSource] = [.mic: micDenoised, .system: systemDenoised]
 
         status = .starting

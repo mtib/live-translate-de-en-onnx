@@ -1,13 +1,14 @@
 import Foundation
 import AVFoundation
 
-/// Streams the live mixed-audio source straight to a `.wav` file on disk.
-/// One instance per run, written under `~/Documents/LiveTranslate/recordings/`.
+/// Streams one denoised audio source straight to a `.wav` file on disk.
+/// One instance per source per run, written under the temp work-dir
+/// (later moved into the per-run zip).
 ///
-/// Stored format is **16 kHz mono signed-16-bit PCM** — same sample rate
-/// the recognizer sees, downcast from Float32 to Int16 by `AVAudioFile`
-/// on the write path. That makes the output universally playable (QuickTime,
-/// VLC, ffmpeg, browsers) at a small bitrate (~32 KB/s).
+/// Stored format is **48 kHz mono signed-16-bit PCM** — RNNoise's native
+/// rate. `AVAudioFile` downcasts Float32 buffers to Int16 on the write
+/// path. The 48 kHz files are universally playable and ffmpeg muxes them
+/// straight into the MKV without resampling.
 ///
 /// Writes are serialized on a private queue so the MainActor — which is
 /// where ingest runs — never blocks on disk IO.

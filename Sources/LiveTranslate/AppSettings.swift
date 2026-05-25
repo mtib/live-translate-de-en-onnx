@@ -1,17 +1,45 @@
 import SwiftUI
+import Combine
 
-/// Persisted display preferences. Inject as `.environmentObject(settings)` at the
-/// app root so `TranscriptView`, `MenuBarView`, and row views all read from the
-/// same source without prop-drilling.
+/// Persisted display preferences. Read by `TranscriptView`, `SummaryView`,
+/// `MenuBarView`, `OptionsView`, and `Pipeline` (which forwards changes to
+/// the live web target).
+///
+/// Backed by UserDefaults with explicit @Published wrappers — using
+/// @AppStorage inside an ObservableObject doesn't fire objectWillChange,
+/// so views observing the object would never re-render on writes.
 final class AppSettings: ObservableObject {
 
-    @AppStorage("settings.transcriptFontSize")   var transcriptFontSize: Double  = 13
-    @AppStorage("settings.translationFontSize")  var translationFontSize: Double  = 16
-    @AppStorage("settings.windowOpacity")         var windowOpacity: Double        = 0.7
-    @AppStorage("settings.layoutModeRaw")         var layoutModeRaw: String        = LayoutMode.mixed.rawValue
-    @AppStorage("settings.transcriptColorHex")    var transcriptColorHex: String   = "#8a8a8a"
-    @AppStorage("settings.translationColorHex")   var translationColorHex: String  = "#eeeeee"
-    @AppStorage("settings.showSource")            var showSource: Bool             = true
+    @Published var transcriptFontSize:   Double { didSet { persist(transcriptFontSize,  for: Self.kTranscriptFontSize)  } }
+    @Published var translationFontSize:  Double { didSet { persist(translationFontSize, for: Self.kTranslationFontSize) } }
+    @Published var windowOpacity:        Double { didSet { persist(windowOpacity,       for: Self.kWindowOpacity)       } }
+    @Published var layoutModeRaw:        String { didSet { persist(layoutModeRaw,       for: Self.kLayoutModeRaw)       } }
+    @Published var transcriptColorHex:   String { didSet { persist(transcriptColorHex,  for: Self.kTranscriptColorHex)  } }
+    @Published var translationColorHex:  String { didSet { persist(translationColorHex, for: Self.kTranslationColorHex) } }
+    @Published var showSource:           Bool   { didSet { persist(showSource,          for: Self.kShowSource)          } }
+
+    init() {
+        let d = UserDefaults.standard
+        transcriptFontSize  = d.object(forKey: Self.kTranscriptFontSize)  as? Double ?? 13
+        translationFontSize = d.object(forKey: Self.kTranslationFontSize) as? Double ?? 16
+        windowOpacity       = d.object(forKey: Self.kWindowOpacity)       as? Double ?? 0.7
+        layoutModeRaw       = d.string(forKey: Self.kLayoutModeRaw)             ?? LayoutMode.mixed.rawValue
+        transcriptColorHex  = d.string(forKey: Self.kTranscriptColorHex)        ?? "#8a8a8a"
+        translationColorHex = d.string(forKey: Self.kTranslationColorHex)       ?? "#eeeeee"
+        showSource          = (d.object(forKey: Self.kShowSource) as? Bool) ?? true
+    }
+
+    private static let kTranscriptFontSize  = "settings.transcriptFontSize"
+    private static let kTranslationFontSize = "settings.translationFontSize"
+    private static let kWindowOpacity       = "settings.windowOpacity"
+    private static let kLayoutModeRaw       = "settings.layoutModeRaw"
+    private static let kTranscriptColorHex  = "settings.transcriptColorHex"
+    private static let kTranslationColorHex = "settings.translationColorHex"
+    private static let kShowSource          = "settings.showSource"
+
+    private func persist<T>(_ value: T, for key: String) {
+        UserDefaults.standard.set(value, forKey: key)
+    }
 
     var layoutMode: LayoutMode {
         get { LayoutMode(rawValue: layoutModeRaw) ?? .mixed }
@@ -28,8 +56,8 @@ final class AppSettings: ObservableObject {
         set { translationColorHex = newValue.hexString ?? translationColorHex }
     }
 
-    /// JSON payload broadcast to web subscribers so they can mirror
-    /// the app's colors and font sizes. Updated whenever any visible
+    /// JSON payload broadcast to web subscribers so they mirror the
+    /// app's colors and font sizes. Updated whenever any visible
     /// setting changes.
     func webPayload() -> String {
         let bg = overlayBackgroundHex()
@@ -71,8 +99,8 @@ func overlayBackgroundHex() -> String {
 
 /// Background color used by the floating overlay and AI summary windows.
 /// In light mode: the system text-background (white). In dark mode: a
-/// darker-than-system grey (#101010) — pure black would crush the
-/// translucency layering, but the default `.textBackgroundColor` (~#1e1e1e)
+/// darker-than-system grey (~#0F0F0F) — pure black would crush the
+/// translucency layering, but the default `.textBackgroundColor` (~#1E1E1E)
 /// reads as too light against full-screen video.
 let overlayBackgroundColor: Color = Color(nsColor: NSColor(name: nil) { appearance in
     let isDark = appearance.bestMatch(from: [.darkAqua, .vibrantDark, .accessibilityHighContrastDarkAqua, .accessibilityHighContrastVibrantDark]) != nil

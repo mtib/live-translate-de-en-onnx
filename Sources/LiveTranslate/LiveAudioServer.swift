@@ -126,7 +126,10 @@ final class LiveAudioServer: @unchecked Sendable {
     /// Safe to call from any thread.
     func append(_ pcm16: Data) {
         broadcastAudio(pcm16)
-        lastSendAt = Date()
+        let now = Date()
+        lock.lock()
+        lastSendAt = now
+        lock.unlock()
     }
 
     /// Sends a named `hypothesis` SSE event to all event subscribers (not replayed).
@@ -194,28 +197,70 @@ final class LiveAudioServer: @unchecked Sendable {
         broadcastRaw(data, to: conns)
     }
 
+    /// JSON-escape a string. Handles backslash, quote, newline, CR,
+    /// tab, backspace, form feed, plus any remaining control character
+    /// (<0x20) as `\u00XX`. Safe for arbitrary unicode text.
     private func jsonEscape(_ s: String) -> String {
-        s.replacingOccurrences(of: "\\", with: "\\\\")
-         .replacingOccurrences(of: "\"", with: "\\\"")
-         .replacingOccurrences(of: "\n", with: "\\n")
-         .replacingOccurrences(of: "\r", with: "\\r")
+        var out = ""
+        out.reserveCapacity(s.count)
+        for scalar in s.unicodeScalars {
+            switch scalar {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            case "\u{08}": out += "\\b"
+            case "\u{0C}": out += "\\f"
+            default:
+                if scalar.value < 0x20 {
+                    out += String(format: "\\u%04x", scalar.value)
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return out
     }
 
     private func handle(_ conn: NWConnection) {
         conn.start(queue: queue)
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, _, _ in
-            guard let self, let data, let req = String(data: data, encoding: .utf8) else {
-                conn.cancel(); return
+        receiveRequest(conn, accumulator: Data())
+    }
+
+    /// Accumulate request bytes until the headers terminator `\r\n\r\n`
+    /// is seen, then dispatch by path. Caps at 16 KB to avoid runaway.
+    private func receiveRequest(_ conn: NWConnection, accumulator: Data) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] chunk, _, isComplete, _ in
+            guard let self else { conn.cancel(); return }
+            var buf = accumulator
+            if let chunk { buf.append(chunk) }
+            guard let req = String(data: buf, encoding: .utf8) else {
+                if isComplete || buf.count > 16_384 { conn.cancel() }
+                else { self.receiveRequest(conn, accumulator: buf) }
+                return
             }
-            let path = Self.requestPath(req)
-            switch path {
+            if req.contains("\r\n\r\n") {
+                let path = Self.requestPath(req)
+                self.dispatchRequest(path: path, conn: conn)
+                return
+            }
+            if isComplete || buf.count > 16_384 {
+                conn.cancel()
+                return
+            }
+            self.receiveRequest(conn, accumulator: buf)
+        }
+    }
+
+    private func dispatchRequest(path: String, conn: NWConnection) {
+        switch path {
             case "/":              self.serveListenPage(conn)
             case "/live.wav":      self.serveAudioStream(conn)
             case "/events":        self.serveEventStream(conn)
             case "/obs":           self.serveOBSPage(conn)
             case "/obs-events":    self.serveOBSEventStream(conn)
             default:               self.serveNotFound(conn)
-            }
         }
     }
 
@@ -268,8 +313,13 @@ final class LiveAudioServer: @unchecked Sendable {
 
     private func serveEventStream(_ conn: NWConnection) {
         let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-store\r\nConnection: close\r\n\r\n".data(using: .utf8)!
-        // Replay buffered events so a late subscriber sees the session so far.
+        // Register the subscriber FIRST so any event published between
+        // here and the replay snapshot is delivered live (rather than
+        // dropped on the floor). Then snapshot the replay and settings
+        // under the same lock and send them as the preamble.
+        let id = UUID()
         lock.lock()
+        eventSubscribers[id] = conn
         let replay = eventReplay
         let settings = currentSettings
         lock.unlock()
@@ -283,22 +333,23 @@ final class LiveAudioServer: @unchecked Sendable {
         // Initial comment line — some proxies need a flush before the
         // first real event for the connection to be considered "live".
         preamble.append(": ready\n\n".data(using: .utf8) ?? Data())
+        Log.line("LiveAudioServer: events subscriber +1 (id=\(id.uuidString.prefix(8)))")
+        conn.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .cancelled, .failed:
+                guard let self else { return }
+                self.lock.lock()
+                self.eventSubscribers.removeValue(forKey: id)
+                self.lock.unlock()
+            default: break
+            }
+        }
         conn.send(content: preamble, completion: .contentProcessed { [weak self] err in
-            guard let self else { return }
-            if err != nil { conn.cancel(); return }
-            let id = UUID()
-            self.lock.lock()
-            self.eventSubscribers[id] = conn
-            self.lock.unlock()
-            Log.line("LiveAudioServer: events subscriber +1 (id=\(id.uuidString.prefix(8)))")
-            conn.stateUpdateHandler = { [weak self] state in
-                switch state {
-                case .cancelled, .failed:
-                    self?.lock.lock()
-                    self?.eventSubscribers.removeValue(forKey: id)
-                    self?.lock.unlock()
-                default: break
-                }
+            if err != nil {
+                self?.lock.lock()
+                self?.eventSubscribers.removeValue(forKey: id)
+                self?.lock.unlock()
+                conn.cancel()
             }
         })
     }
@@ -313,23 +364,28 @@ final class LiveAudioServer: @unchecked Sendable {
     private func serveOBSEventStream(_ conn: NWConnection) {
         let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-store\r\nConnection: close\r\n\r\n".data(using: .utf8)!
         let preamble = headers + (": ready\n\n".data(using: .utf8) ?? Data())
+        let id = UUID()
+        lock.lock()
+        obsSubscribers[id] = conn
+        lock.unlock()
+        Log.line("LiveAudioServer: obs-events subscriber +1 (id=\(id.uuidString.prefix(8)))")
+        conn.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .cancelled, .failed:
+                guard let self else { return }
+                self.lock.lock()
+                self.obsSubscribers.removeValue(forKey: id)
+                self.lock.unlock()
+                Log.line("LiveAudioServer: OBS subscriber -1 (id=\(id.uuidString.prefix(8)))")
+            default: break
+            }
+        }
         conn.send(content: preamble, completion: .contentProcessed { [weak self] err in
-            guard let self else { return }
-            if err != nil { conn.cancel(); return }
-            let id = UUID()
-            self.lock.lock()
-            self.obsSubscribers[id] = conn
-            self.lock.unlock()
-            Log.line("LiveAudioServer: obs-events subscriber +1 (id=\(id.uuidString.prefix(8)))")
-            conn.stateUpdateHandler = { [weak self] state in
-                switch state {
-                case .cancelled, .failed:
-                    self?.lock.lock()
-                    self?.obsSubscribers.removeValue(forKey: id)
-                    self?.lock.unlock()
-                    Log.line("LiveAudioServer: OBS subscriber -1 (id=\(id.uuidString.prefix(8)))")
-                default: break
-                }
+            if err != nil {
+                self?.lock.lock()
+                self?.obsSubscribers.removeValue(forKey: id)
+                self?.lock.unlock()
+                conn.cancel()
             }
         })
     }
@@ -693,7 +749,10 @@ final class LiveAudioServer: @unchecked Sendable {
       from { opacity: 0; transform: translateY(4px); }
       to   { opacity: 1; transform: translateY(0); }
     }
-    .row.finalized { animation: fadein 0.18s ease-out; }
+    /* Only animate brand-new rows that bypass the hypothesis flow. Rows
+       that get upgraded from hypothesis are already on screen — animating
+       them again causes a visible flicker on graduation. */
+    .row.fresh { animation: fadein 0.18s ease-out; }
     .empty { text-align: center; color: #555; padding: 60px 16px; font-size: 14px; }
     audio { display: none; }
     </style>
@@ -835,8 +894,11 @@ final class LiveAudioServer: @unchecked Sendable {
       function onHypothesisDone(d) {
         const row = hypothesisRows.get(d.id);
         if (row) {
+          // Keep the row visually intact — no animation, no class change.
+          // It's already on screen; onFinalized will find it via the
+          // `data-pending` marker and overwrite its contents in place.
           row.classList.remove('hypothesis');
-          row.classList.add('finalized');
+          row.dataset.pending = '1';
           hypothesisRows.delete(d.id);
         }
       }
@@ -847,25 +909,31 @@ final class LiveAudioServer: @unchecked Sendable {
         seen.add(key);
         const empty = list.querySelector('.empty');
         if (empty) empty.remove();
-        // Reuse the upgraded hypothesis row (hypothesis-done already fired and removed the class).
-        // Find a finalized row without a key yet (just upgraded).
-        let row = [...list.querySelectorAll('.row.finalized')].find(r => !r.dataset.key);
-        if (!row) {
+        // Reuse the just-upgraded hypothesis row (marked data-pending="1").
+        let row = list.querySelector('.row[data-pending="1"]');
+        const isNew = !row;
+        if (isNew) {
           row = document.createElement('div');
-          row.className = 'row finalized';
+          // `fresh` triggers the fadein animation only for rows that
+          // didn't exist as a hypothesis first.
+          row.className = 'row fresh';
           list.appendChild(row);
+        } else {
+          delete row.dataset.pending;
         }
         row.dataset.key = key;
-        row.innerHTML = '';
-        const t = document.createElement('div');
-        t.className = 'translation';
-        t.textContent = rec.translation || rec.transcription || '';
-        row.appendChild(t);
-        if (rec.translation && rec.transcription && rec.translation !== rec.transcription) {
-          const s = document.createElement('div');
-          s.className = 'transcription';
-          s.textContent = rec.transcription;
-          row.appendChild(s);
+        // Update contents in-place so the existing layout doesn't reflow.
+        const newTrans = rec.translation || rec.transcription || '';
+        let tDiv = row.querySelector('.translation');
+        if (!tDiv) { tDiv = document.createElement('div'); tDiv.className = 'translation'; row.insertBefore(tDiv, row.firstChild); }
+        if (tDiv.textContent !== newTrans) tDiv.textContent = newTrans;
+        const showCaption = rec.translation && rec.transcription && rec.translation !== rec.transcription;
+        let sDiv = row.querySelector('.transcription');
+        if (showCaption) {
+          if (!sDiv) { sDiv = document.createElement('div'); sDiv.className = 'transcription'; row.appendChild(sDiv); }
+          if (sDiv.textContent !== rec.transcription) sDiv.textContent = rec.transcription;
+        } else if (sDiv) {
+          sDiv.remove();
         }
         if (row.parentElement !== list) list.appendChild(row);
         trimRows();
