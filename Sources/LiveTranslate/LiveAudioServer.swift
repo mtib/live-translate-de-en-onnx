@@ -622,9 +622,26 @@ final class LiveAudioServer: @unchecked Sendable {
       transition: opacity 0.8s ease-out;
     }
     .sub-line.fading { opacity: 0; }
+    #indicator {
+      position: fixed;
+      top: 16px; right: 16px;
+      width: 48px; height: 48px;
+      border-radius: 11px;
+      background: linear-gradient(180deg, #3389f5 0%, #0d47c7 100%);
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.35);
+      opacity: 0.85;
+    }
+    #indicator svg { width: 60%; height: 60%; fill: #fff; }
     </style>
     </head>
     <body>
+    <div id="indicator" title="LiveTranslate overlay connected">
+      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <path d="M3 5.5A2.5 2.5 0 0 1 5.5 3h7A2.5 2.5 0 0 1 15 5.5v4A2.5 2.5 0 0 1 12.5 12H9l-3.2 2.6a.5.5 0 0 1-.8-.4V12a2.5 2.5 0 0 1-2-2.45v-4Z"/>
+        <path d="M11 14.5A2.5 2.5 0 0 1 13.5 12h5A2.5 2.5 0 0 1 21 14.5v3A2.5 2.5 0 0 1 18.5 20v1.2a.5.5 0 0 1-.8.4L15 19.5h-1.5A2.5 2.5 0 0 1 11 17z"/>
+      </svg>
+    </div>
     <div id="stack"></div>
     <script>
     (function () {
